@@ -353,61 +353,95 @@ Respond with EXACTLY this structure — nothing else outside the markers:
 ===CITATION_TYPE_END===
 """
 
+# Templates for chunked conversion (long documents)
+_FIRST_CHUNK_TEMPLATE = """\
+Convert the following Word document content to LaTeX (part 1 of {n_total}).
 
-def convert_to_latex(content: dict) -> tuple[str, str]:
-    content_json = json.dumps(content, ensure_ascii=False, indent=2)
-    user_message = USER_TEMPLATE.format(content_json=content_json)
+DOCUMENT CONTENT (JSON):
+{content_json}
 
+Generate the complete LaTeX preamble and body for these elements.
+Do NOT include \\end{{document}} — more content follows in subsequent parts.
+
+Respond with EXACTLY:
+
+===LATEX_START===
+<complete preamble + body up to (but NOT including) \\end{{document}}>
+===LATEX_END===
+"""
+
+_MIDDLE_CHUNK_TEMPLATE = """\
+Continue the LaTeX document (part {i} of {n_total}).
+
+DOCUMENT CONTENT (JSON):
+{content_json}
+
+Output ONLY the raw LaTeX body lines for these elements.
+No \\documentclass, no preamble, no \\end{{document}}, no markers.
+"""
+
+_LAST_CHUNK_TEMPLATE = """\
+Finish the LaTeX document (final part {i} of {n_total}).
+
+DOCUMENT CONTENT (JSON):
+{content_json}
+
+Respond with EXACTLY this structure:
+
+===LATEX_CONTINUATION===
+<body for these elements, ending with \\end{{document}}>
+===LATEX_CONTINUATION_END===
+
+===BIB_START===
+<BibTeX entries, or the single word EMPTY if there are no references>
+===BIB_END===
+
+===BIBSTYLE===
+<apalike / ieeetr / plain / unsrt — or NONE>
+===BIBSTYLE_END===
+
+===CITATION_TYPE===
+<apa_natbib or numeric>
+===CITATION_TYPE_END===
+"""
+
+# JSON chars thresholds
+_SINGLE_CALL_LIMIT = 80_000   # below → one API call
+_CHUNK_TARGET      = 50_000   # target JSON chars per chunk
+
+
+def _extract_between(text: str, start: str, end: str) -> str:
+    m = re.search(re.escape(start) + r"(.*?)" + re.escape(end), text, re.DOTALL)
+    return m.group(1).strip() if m else ""
+
+
+def _call_claude(user_message: str, max_tokens: int = 8000) -> str:
     with client.messages.stream(
         model="claude-sonnet-4-6",
-        max_tokens=16000,
+        max_tokens=max_tokens,
         system=SYSTEM_PROMPT,
         messages=[{"role": "user", "content": user_message}],
     ) as stream:
         response = stream.get_final_message()
+    return "".join(block.text for block in response.content if block.type == "text")
 
-    full_text = "".join(
-        block.text for block in response.content if block.type == "text"
-    )
 
-    def extract_between(start: str, end: str) -> str:
-        m = re.search(re.escape(start) + r"(.*?)" + re.escape(end), full_text, re.DOTALL)
-        return m.group(1).strip() if m else ""
-
-    latex_content = extract_between("===LATEX_START===", "===LATEX_END===")
-    bib_raw       = extract_between("===BIB_START===",   "===BIB_END===")
-    bib_style     = extract_between("===BIBSTYLE===",     "===BIBSTYLE_END===")
-    citation_type = extract_between("===CITATION_TYPE===", "===CITATION_TYPE_END===").lower()
-
-    # Fallback: if markers were missing, try to find a LaTeX document in the raw text
-    if not latex_content:
-        # Look for \documentclass ... \end{document}
-        m = re.search(r"(\\documentclass.*?\\end\{document\})", full_text, re.DOTALL)
-        if m:
-            latex_content = m.group(1).strip()
-        # Also try markdown code fences: ```latex ... ``` or ``` ... ```
-        if not latex_content:
-            m = re.search(r"```(?:latex|tex)?\s*(\\documentclass.*?\\end\{document\})\s*```", full_text, re.DOTALL)
-            if m:
-                latex_content = m.group(1).strip()
-
+def _postprocess(latex_content: str, bib_raw: str, bib_style: str, citation_type: str) -> tuple[str, str]:
+    """Inject bibliography and fix APA citations."""
     bib_content = "" if bib_raw.upper() == "EMPTY" else bib_raw
     if bib_style.upper() == "NONE":
         bib_style = ""
 
     is_apa = "apa" in citation_type or bib_style == "apalike"
 
-    # Ensure natbib is in the preamble for APA documents
     if bib_content and is_apa:
         if "natbib" not in latex_content:
             latex_content = latex_content.replace(
                 "\\begin{document}",
                 "\\usepackage[round,authoryear]{natbib}\n\\begin{document}",
             )
-        # Replace any leftover plain \cite{ with \citep{ for APA
         latex_content = re.sub(r'\\cite\{', r'\\citep{', latex_content)
 
-    # Inject bibliography commands if Claude forgot
     if bib_content and "\\end{document}" in latex_content:
         if "\\bibliography{" not in latex_content and "\\printbibliography" not in latex_content:
             style_cmd = f"\\bibliographystyle{{{bib_style}}}\n" if bib_style else ""
@@ -416,7 +450,126 @@ def convert_to_latex(content: dict) -> tuple[str, str]:
                 f"{style_cmd}\\bibliography{{references}}\n\\end{{document}}",
             )
 
+    return latex_content, bib_content
+
+
+def _chunk_elements(elements: list) -> list[list]:
+    """Split elements into groups whose JSON size ≈ _CHUNK_TARGET chars."""
+    chunks, current, current_len = [], [], 0
+    for elem in elements:
+        s = len(json.dumps(elem, ensure_ascii=False))
+        if current and current_len + s > _CHUNK_TARGET:
+            chunks.append(current)
+            current, current_len = [elem], s
+        else:
+            current.append(elem)
+            current_len += s
+    if current:
+        chunks.append(current)
+    return chunks
+
+
+def _convert_single(content: dict) -> tuple[str, str, str]:
+    content_json = json.dumps(content, ensure_ascii=False, indent=2)
+    full_text = _call_claude(USER_TEMPLATE.format(content_json=content_json), max_tokens=16000)
+
+    latex_content = _extract_between(full_text, "===LATEX_START===", "===LATEX_END===")
+    bib_raw       = _extract_between(full_text, "===BIB_START===",   "===BIB_END===")
+    bib_style     = _extract_between(full_text, "===BIBSTYLE===",     "===BIBSTYLE_END===")
+    citation_type = _extract_between(full_text, "===CITATION_TYPE===", "===CITATION_TYPE_END===").lower()
+
+    # Fallback regexes if markers missing
+    if not latex_content:
+        m = re.search(r"(\\documentclass.*?\\end\{document\})", full_text, re.DOTALL)
+        if m:
+            latex_content = m.group(1).strip()
+    if not latex_content:
+        m = re.search(r"```(?:latex|tex)?\s*(\\documentclass.*?\\end\{document\})\s*```", full_text, re.DOTALL)
+        if m:
+            latex_content = m.group(1).strip()
+
+    latex_content, bib_content = _postprocess(latex_content, bib_raw, bib_style, citation_type)
     return latex_content, bib_content, full_text
+
+
+def _convert_chunked(content: dict) -> tuple[str, str, str]:
+    elements   = content.get("elements", [])
+    metadata   = content.get("metadata", {})
+    image_list = content.get("image_list", [])
+    chunks     = _chunk_elements(elements)
+    n          = len(chunks)
+
+    # Edge case: chunking produced a single chunk anyway
+    if n == 1:
+        return _convert_single(content)
+
+    all_raw: list[str] = []
+
+    # --- Chunk 1: preamble + body start ---
+    first_json = json.dumps(
+        {"metadata": metadata, "elements": chunks[0], "image_list": image_list},
+        ensure_ascii=False, indent=2,
+    )
+    first_text = _call_claude(
+        _FIRST_CHUNK_TEMPLATE.format(n_total=n, content_json=first_json),
+        max_tokens=8000,
+    )
+    all_raw.append(first_text)
+
+    latex_body = _extract_between(first_text, "===LATEX_START===", "===LATEX_END===")
+    if not latex_body:
+        m = re.search(r"(\\documentclass.*)", first_text, re.DOTALL)
+        latex_body = m.group(1).strip() if m else first_text.strip()
+    # Remove accidental \end{document} from the first chunk
+    latex_body = re.sub(r'\\end\{document\}\s*$', '', latex_body).rstrip()
+
+    # --- Middle chunks: body only ---
+    for i, chunk in enumerate(chunks[1:-1], start=2):
+        chunk_json = json.dumps(
+            {"metadata": {}, "elements": chunk, "image_list": []},
+            ensure_ascii=False, indent=2,
+        )
+        chunk_text = _call_claude(
+            _MIDDLE_CHUNK_TEMPLATE.format(i=i, n_total=n, content_json=chunk_json),
+            max_tokens=8000,
+        )
+        all_raw.append(chunk_text)
+        latex_body += "\n\n" + chunk_text.strip()
+
+    # --- Last chunk: close document + bib ---
+    last_json = json.dumps(
+        {"metadata": {}, "elements": chunks[-1], "image_list": []},
+        ensure_ascii=False, indent=2,
+    )
+    last_text = _call_claude(
+        _LAST_CHUNK_TEMPLATE.format(i=n, n_total=n, content_json=last_json),
+        max_tokens=8000,
+    )
+    all_raw.append(last_text)
+
+    last_body     = _extract_between(last_text, "===LATEX_CONTINUATION===", "===LATEX_CONTINUATION_END===")
+    bib_raw       = _extract_between(last_text, "===BIB_START===",          "===BIB_END===")
+    bib_style     = _extract_between(last_text, "===BIBSTYLE===",            "===BIBSTYLE_END===")
+    citation_type = _extract_between(last_text, "===CITATION_TYPE===",       "===CITATION_TYPE_END===").lower()
+
+    if not last_body:
+        last_body = last_text.strip()
+
+    latex_content = latex_body + "\n\n" + last_body
+
+    # Safety: ensure document is closed
+    if "\\end{document}" not in latex_content:
+        latex_content += "\n\\end{document}"
+
+    latex_content, bib_content = _postprocess(latex_content, bib_raw, bib_style, citation_type)
+    return latex_content, bib_content, "\n\n---CHUNK BREAK---\n\n".join(all_raw)
+
+
+def convert_to_latex(content: dict) -> tuple[str, str, str]:
+    content_json_size = len(json.dumps(content, ensure_ascii=False))
+    if content_json_size <= _SINGLE_CALL_LIMIT:
+        return _convert_single(content)
+    return _convert_chunked(content)
 
 
 # ---------------------------------------------------------------------------

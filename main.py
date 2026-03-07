@@ -82,6 +82,11 @@ def extract_images_from_docx(file_bytes: bytes) -> dict[str, bytes]:
 # Paragraph / table extraction
 # ---------------------------------------------------------------------------
 
+# VML namespace not registered in all python-docx versions — use URI directly
+_VML_IMAGEDATA = "{urn:schemas-microsoft-com:vml}imagedata"
+_R_ID = "{http://schemas.openxmlformats.org/officeDocument/2006/relationships}id"
+
+
 def get_image_refs_in_para(para, rel_to_image: dict) -> list[str]:
     """Return list of image filenames embedded in this paragraph."""
     refs = []
@@ -90,9 +95,9 @@ def get_image_refs_in_para(para, rel_to_image: dict) -> list[str]:
         r_embed = blip.get(qn("r:embed")) or blip.get(qn("r:link"))
         if r_embed and r_embed in rel_to_image:
             refs.append(rel_to_image[r_embed][0])
-    # Also catch v:imagedata (older .docx)
-    for imgdata in para._element.iter(qn("v:imagedata")):
-        r_id = imgdata.get(qn("r:id"))
+    # Also catch v:imagedata (older .docx) — use hardcoded URI, not qn("v:...")
+    for imgdata in para._element.iter(_VML_IMAGEDATA):
+        r_id = imgdata.get(_R_ID)
         if r_id and r_id in rel_to_image:
             refs.append(rel_to_image[r_id][0])
     return refs

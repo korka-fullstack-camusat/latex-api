@@ -416,7 +416,7 @@ def convert_to_latex(content: dict) -> tuple[str, str]:
                 f"{style_cmd}\\bibliography{{references}}\n\\end{{document}}",
             )
 
-    return latex_content, bib_content
+    return latex_content, bib_content, full_text
 
 
 # ---------------------------------------------------------------------------
@@ -451,15 +451,14 @@ async def convert_word_to_latex(
 
     # Convert to LaTeX via Claude
     try:
-        latex_content, bib_content = convert_to_latex(content)
+        latex_content, bib_content, raw_response = convert_to_latex(content)
     except anthropic.APIError as exc:
         raise HTTPException(status_code=502, detail=f"Claude API error: {exc}")
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"Conversion failed: {exc}")
 
     if not latex_content:
-        # Log first 500 chars to help diagnose future issues
-        preview = "(empty response)"
+        preview = raw_response[:500].replace("\n", " ") if raw_response else "(empty response)"
         raise HTTPException(
             status_code=500,
             detail=f"Claude did not return any LaTeX content. Response preview: {preview}",

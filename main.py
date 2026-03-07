@@ -257,55 +257,75 @@ LaTeX document that reproduces the original as faithfully as possible.
 
 Rules:
 1. Choose document class (article / report / book) based on content.
-2. Always include: inputenc (utf8), fontenc (T1), geometry, hyperref,
-   graphicx, booktabs, amsmath, caption, float.
-3. Formatting: bold→\\textbf{}, italic→\\textit{}, underline→\\underline{},
+2. Always include these packages in the preamble:
+   \\usepackage[utf8]{inputenc}
+   \\usepackage[T1]{fontenc}
+   \\usepackage[margin=2.5cm]{geometry}
+   \\usepackage{graphicx}
+   \\usepackage{booktabs}
+   \\usepackage{amsmath}
+   \\usepackage{caption}
+   \\usepackage{float}
+   \\usepackage{setspace}
+   \\usepackage{parskip}
+   \\usepackage[colorlinks=true, linkcolor=blue, citecolor=blue, urlcolor=blue, filecolor=blue]{hyperref}
+
+3. PARAGRAPH FORMATTING (mandatory):
+   - ALWAYS add \\setlength{\\parindent}{0pt} after \\begin{document} (no indent at start of paragraphs).
+   - ALWAYS add \\setlength{\\parskip}{6pt} for spacing between paragraphs.
+   - Do NOT use \\noindent individually; the global setting handles it.
+
+4. HYPERREF LINKS: Use colorlinks=true with blue color for ALL link types.
+   NEVER use colored boxes (pdfborder or default boxed links). Links must appear
+   as blue-colored text, not wrapped in green/red/colored rectangles.
+
+5. Formatting: bold→\\textbf{}, italic→\\textit{}, underline→\\underline{},
    superscript→\\textsuperscript{}, subscript→\\textsubscript{}.
-4. Headings: Heading 1→\\section, 2→\\subsection, 3→\\subsubsection,
+6. Headings: Heading 1→\\section, 2→\\subsection, 3→\\subsubsection,
    Title→\\title{} + \\maketitle, Subtitle→use \\date{} or subtitle package.
-5. Tables → tabular with booktabs (\\toprule, \\midrule, \\bottomrule).
-6. Bulleted lists → itemize; numbered → enumerate.
-7. Quotes → quotation environment.
+7. Tables → tabular with booktabs (\\toprule, \\midrule, \\bottomrule).
+8. Bulleted lists → itemize; numbered → enumerate.
+9. Quotes → quotation environment.
 
-8. IMAGES (important):
-   Each element with "type":"image" contains an "images" list of filenames
-   (e.g. ["figure_1.png"]).  These files ARE included in the ZIP alongside
-   the .tex file.
-   For every image element generate:
+10. IMAGES (important):
+    Each element with "type":"image" contains an "images" list of filenames
+    (e.g. ["figure_1.png"]).  These files ARE included in the ZIP alongside
+    the .tex file.
+    For every image element generate:
 
-   \\begin{figure}[H]
-     \\centering
-     \\includegraphics[width=0.8\\linewidth]{figure_1}
-     \\caption{<caption text if next element is a Caption, else leave descriptive placeholder>}
-     \\label{fig:figure_1}
-   \\end{figure}
+    \\begin{figure}[H]
+      \\centering
+      \\includegraphics[width=0.8\\linewidth]{figure_1}
+      \\caption{<caption text if next element is a Caption, else leave descriptive placeholder>}
+      \\label{fig:figure_1}
+    \\end{figure}
 
-   - Use the filename WITHOUT extension in \\includegraphics{}.
-   - If the following element has type "caption", use its text and skip it as
-     a standalone paragraph.
-   - If there is no caption, write a short descriptive placeholder like
-     \\caption{Figure extracted from document}.
-   - Always use the float package option [H] so figures stay in place.
+    - Use the filename WITHOUT extension in \\includegraphics{}.
+    - If the following element has type "caption", use its text and skip it as
+      a standalone paragraph.
+    - If there is no caption, write a short descriptive placeholder like
+      \\caption{Figure extracted from document}.
+    - Always use the float package option [H] so figures stay in place.
 
-9. References / Bibliography:
-   a. Detect citation style from the references section of the document.
-   b. Create proper @article/@book/@misc BibTeX entries.
+11. References / Bibliography:
+    a. Detect citation style from the references section of the document.
+    b. Create proper @article/@book/@misc BibTeX entries.
 
-   c. APA style (most common — Author, Year format):
-      - ALWAYS add \\usepackage[round,authoryear]{natbib} to the preamble.
-      - Use bibliographystyle{apalike}.
-      - In-text parenthetical citation  → \\citep{key}   → produces (Author, Year)
-      - In-text narrative citation       → \\citet{key}   → produces Author (Year)
-      - NEVER use plain \\cite{} for APA; it produces [key] which is wrong.
+    c. APA style (most common — Author, Year format):
+       - ALWAYS add \\usepackage[round,authoryear]{natbib} to the preamble.
+       - Use bibliographystyle{apalike}.
+       - In-text parenthetical citation  → \\citep{key}   → produces (Author, Year)
+       - In-text narrative citation       → \\citet{key}   → produces Author (Year)
+       - NEVER use plain \\cite{} for APA; it produces [key] which is wrong.
 
-   d. IEEE / numeric styles (ieeetr, unsrt, plain):
-      - Do NOT add natbib.
-      - Use plain \\cite{key} → produces [1], [2], …
+    d. IEEE / numeric styles (ieeetr, unsrt, plain):
+       - Do NOT add natbib.
+       - Use plain \\cite{key} → produces [1], [2], …
 
-   e. Default to APA/natbib if the citation style cannot be determined.
+    e. Default to APA/natbib if the citation style cannot be determined.
 
-10. Handle special characters and accents.
-11. Close with \\end{document}.
+12. Handle special characters and accents.
+13. Close with \\end{document}.
 """
 
 USER_TEMPLATE = """\

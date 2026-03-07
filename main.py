@@ -8,12 +8,32 @@ from typing import Optional
 import anthropic
 from docx import Document
 from docx.oxml.ns import qn
+import os
+
 from fastapi import FastAPI, File, HTTPException, UploadFile
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 
 app = FastAPI(
     title="Word to LaTeX Converter",
     description="Upload a Word document (.docx) and get a compilable LaTeX file + references.bib + images",
+)
+
+# ---------------------------------------------------------------------------
+# CORS — allow the Next.js frontend to call the API from the browser.
+# Set ALLOWED_ORIGINS to a comma-separated list of origins in production,
+# e.g.  ALLOWED_ORIGINS=https://myapp.com,https://www.myapp.com
+# ---------------------------------------------------------------------------
+_raw_origins = os.getenv("ALLOWED_ORIGINS", "http://localhost:3000")
+_allowed_origins = [o.strip() for o in _raw_origins.split(",") if o.strip()]
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=_allowed_origins,
+    allow_methods=["POST", "GET"],
+    allow_headers=["*"],
+    # Expose custom response headers so the browser JS can read them.
+    expose_headers=["Content-Disposition", "X-Has-Bibliography", "X-Image-Count"],
 )
 
 client = anthropic.Anthropic()
@@ -268,10 +288,21 @@ Rules:
    - Always use the float package option [H] so figures stay in place.
 
 9. References / Bibliography:
-   a. Detect citation style (APA→apalike, IEEE→ieeetr, Vancouver→unsrt,
-      MLA/Chicago→plain) and use it.
+   a. Detect citation style from the references section of the document.
    b. Create proper @article/@book/@misc BibTeX entries.
-   c. Insert \\cite{key} in body text for in-text citations.
+
+   c. APA style (most common — Author, Year format):
+      - ALWAYS add \\usepackage[round,authoryear]{natbib} to the preamble.
+      - Use bibliographystyle{apalike}.
+      - In-text parenthetical citation  → \\citep{key}   → produces (Author, Year)
+      - In-text narrative citation       → \\citet{key}   → produces Author (Year)
+      - NEVER use plain \\cite{} for APA; it produces [key] which is wrong.
+
+   d. IEEE / numeric styles (ieeetr, unsrt, plain):
+      - Do NOT add natbib.
+      - Use plain \\cite{key} → produces [1], [2], …
+
+   e. Default to APA/natbib if the citation style cannot be determined.
 
 10. Handle special characters and accents.
 11. Close with \\end{document}.
@@ -296,6 +327,10 @@ Respond with EXACTLY this structure — nothing else outside the markers:
 ===BIBSTYLE===
 <BibTeX style name: apalike / ieeetr / plain / unsrt — or NONE if no references>
 ===BIBSTYLE_END===
+
+===CITATION_TYPE===
+<apa_natbib if style is APA (uses natbib + \\citep/\\citet) — or numeric if style is IEEE/Vancouver/plain>
+===CITATION_TYPE_END===
 """
 
 
@@ -323,10 +358,23 @@ def convert_to_latex(content: dict) -> tuple[str, str]:
     latex_content = extract_between("===LATEX_START===", "===LATEX_END===")
     bib_raw       = extract_between("===BIB_START===",   "===BIB_END===")
     bib_style     = extract_between("===BIBSTYLE===",     "===BIBSTYLE_END===")
+    citation_type = extract_between("===CITATION_TYPE===", "===CITATION_TYPE_END===").lower()
 
     bib_content = "" if bib_raw.upper() == "EMPTY" else bib_raw
     if bib_style.upper() == "NONE":
         bib_style = ""
+
+    is_apa = "apa" in citation_type or bib_style == "apalike"
+
+    # Ensure natbib is in the preamble for APA documents
+    if bib_content and is_apa:
+        if "natbib" not in latex_content:
+            latex_content = latex_content.replace(
+                "\\begin{document}",
+                "\\usepackage[round,authoryear]{natbib}\n\\begin{document}",
+            )
+        # Replace any leftover plain \cite{ with \citep{ for APA
+        latex_content = re.sub(r'\\cite\{', r'\\citep{', latex_content)
 
     # Inject bibliography commands if Claude forgot
     if bib_content and "\\end{document}" in latex_content:

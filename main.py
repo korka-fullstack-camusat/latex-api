@@ -379,6 +379,18 @@ def convert_to_latex(content: dict) -> tuple[str, str]:
     bib_style     = extract_between("===BIBSTYLE===",     "===BIBSTYLE_END===")
     citation_type = extract_between("===CITATION_TYPE===", "===CITATION_TYPE_END===").lower()
 
+    # Fallback: if markers were missing, try to find a LaTeX document in the raw text
+    if not latex_content:
+        # Look for \documentclass ... \end{document}
+        m = re.search(r"(\\documentclass.*?\\end\{document\})", full_text, re.DOTALL)
+        if m:
+            latex_content = m.group(1).strip()
+        # Also try markdown code fences: ```latex ... ``` or ``` ... ```
+        if not latex_content:
+            m = re.search(r"```(?:latex|tex)?\s*(\\documentclass.*?\\end\{document\})\s*```", full_text, re.DOTALL)
+            if m:
+                latex_content = m.group(1).strip()
+
     bib_content = "" if bib_raw.upper() == "EMPTY" else bib_raw
     if bib_style.upper() == "NONE":
         bib_style = ""
@@ -446,7 +458,12 @@ async def convert_word_to_latex(
         raise HTTPException(status_code=500, detail=f"Conversion failed: {exc}")
 
     if not latex_content:
-        raise HTTPException(status_code=500, detail="Claude did not return any LaTeX content.")
+        # Log first 500 chars to help diagnose future issues
+        preview = full_text[:500].replace("\n", " ") if full_text else "(empty response)"
+        raise HTTPException(
+            status_code=500,
+            detail=f"Claude did not return any LaTeX content. Response preview: {preview}",
+        )
 
     # Build ZIP
     zip_buffer = io.BytesIO()

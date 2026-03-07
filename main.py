@@ -2,6 +2,7 @@ import io
 import re
 import json
 import zipfile
+import xml.etree.ElementTree as ET
 from typing import Optional
 
 import anthropic
@@ -12,21 +13,95 @@ from fastapi.responses import StreamingResponse
 
 app = FastAPI(
     title="Word to LaTeX Converter",
-    description="Upload a Word document (.docx) and get a compilable LaTeX file + references.bib",
+    description="Upload a Word document (.docx) and get a compilable LaTeX file + references.bib + images",
 )
 
 client = anthropic.Anthropic()
 
 
 # ---------------------------------------------------------------------------
-# Word document extraction
+# Image extraction
 # ---------------------------------------------------------------------------
 
-def extract_paragraph_info(para) -> Optional[dict]:
-    """Return structured info for a paragraph, or None if empty."""
+# Map MIME / extension → LaTeX-friendly extension
+EXT_MAP = {
+    "jpeg": "jpg", "jpg": "jpg", "png": "png",
+    "gif": "png",  "bmp": "png", "tiff": "png",
+    "emf": "pdf",  "wmf": "pdf",
+}
+
+def extract_images_from_docx(file_bytes: bytes) -> dict[str, bytes]:
+    """
+    Open the .docx ZIP and extract every media file.
+    Returns {relationship_id: (clean_filename, raw_bytes)}.
+    """
+    rel_to_image: dict[str, tuple[str, bytes]] = {}
+
+    with zipfile.ZipFile(io.BytesIO(file_bytes)) as z:
+        # Parse word/_rels/document.xml.rels to map rId → media path
+        try:
+            rels_xml = z.read("word/_rels/document.xml.rels")
+        except KeyError:
+            return {}
+
+        ns = {"r": "http://schemas.openxmlformats.org/package/2006/relationships"}
+        rels_tree = ET.fromstring(rels_xml)
+        counter = 1
+
+        for rel in rels_tree.findall("r:Relationship", ns):
+            rel_type = rel.get("Type", "")
+            if "image" not in rel_type.lower():
+                continue
+
+            rel_id = rel.get("Id", "")
+            target = rel.get("Target", "")
+
+            # Resolve path inside the ZIP
+            if target.startswith("/"):
+                zip_path = target.lstrip("/")
+            else:
+                zip_path = f"word/{target}"
+
+            try:
+                img_bytes = z.read(zip_path)
+            except KeyError:
+                continue
+
+            # Determine a clean extension
+            orig_ext = zip_path.rsplit(".", 1)[-1].lower() if "." in zip_path else "png"
+            ext = EXT_MAP.get(orig_ext, orig_ext)
+            clean_name = f"figure_{counter}.{ext}"
+            counter += 1
+
+            rel_to_image[rel_id] = (clean_name, img_bytes)
+
+    return rel_to_image
+
+
+# ---------------------------------------------------------------------------
+# Paragraph / table extraction
+# ---------------------------------------------------------------------------
+
+def get_image_refs_in_para(para, rel_to_image: dict) -> list[str]:
+    """Return list of image filenames embedded in this paragraph."""
+    refs = []
+    # w:drawing → wp:inline/wp:anchor → a:blip r:embed
+    for blip in para._element.iter(qn("a:blip")):
+        r_embed = blip.get(qn("r:embed")) or blip.get(qn("r:link"))
+        if r_embed and r_embed in rel_to_image:
+            refs.append(rel_to_image[r_embed][0])
+    # Also catch v:imagedata (older .docx)
+    for imgdata in para._element.iter(qn("v:imagedata")):
+        r_id = imgdata.get(qn("r:id"))
+        if r_id and r_id in rel_to_image:
+            refs.append(rel_to_image[r_id][0])
+    return refs
+
+
+def extract_paragraph_info(para, rel_to_image: dict) -> Optional[dict]:
+    """Return structured info for a paragraph, or None if empty and no images."""
     style_name = para.style.name if para.style else "Normal"
 
-    # Map style name → paragraph type
     para_type = "paragraph"
     level = 0
 
@@ -47,7 +122,7 @@ def extract_paragraph_info(para) -> Optional[dict]:
     elif "List" in style_name:
         para_type = "list_item"
 
-    # Detect numbered / bulleted lists via XML numPr element
+    # Detect list via XML
     num_pr = para._element.find(qn("w:numPr"))
     if num_pr is not None:
         para_type = "list_item"
@@ -55,25 +130,28 @@ def extract_paragraph_info(para) -> Optional[dict]:
         if ilvl_el is not None:
             level = int(ilvl_el.get(qn("w:val"), 0))
 
-    # Extract formatted runs
+    # Detect embedded images
+    image_refs = get_image_refs_in_para(para, rel_to_image)
+    if image_refs:
+        para_type = "image"
+
+    # Formatted runs
     runs = []
     for run in para.runs:
         if run.text:
-            runs.append(
-                {
-                    "text": run.text,
-                    "bold": bool(run.bold),
-                    "italic": bool(run.italic),
-                    "underline": bool(run.underline),
-                    "superscript": bool(run.font.superscript) if run.font.superscript else False,
-                    "subscript": bool(run.font.subscript) if run.font.subscript else False,
-                }
-            )
+            runs.append({
+                "text": run.text,
+                "bold": bool(run.bold),
+                "italic": bool(run.italic),
+                "underline": bool(run.underline),
+                "superscript": bool(run.font.superscript) if run.font.superscript else False,
+                "subscript": bool(run.font.subscript) if run.font.subscript else False,
+            })
 
-    if not runs and not para.text.strip():
+    if not runs and not para.text.strip() and not image_refs:
         return None
 
-    return {
+    info: dict = {
         "type": para_type,
         "style": style_name,
         "level": level,
@@ -81,18 +159,20 @@ def extract_paragraph_info(para) -> Optional[dict]:
         "runs": runs,
         "alignment": str(para.alignment) if para.alignment else None,
     }
+    if image_refs:
+        info["images"] = image_refs   # e.g. ["figure_1.png", "figure_2.png"]
+
+    return info
 
 
 def extract_table_info(table) -> dict:
-    """Return structured info for a table."""
     rows = []
     for row in table.rows:
-        row_data = []
-        for cell in row.cells:
-            cell_text = " ".join(p.text for p in cell.paragraphs).strip()
-            row_data.append(cell_text)
+        row_data = [
+            " ".join(p.text for p in cell.paragraphs).strip()
+            for cell in row.cells
+        ]
         rows.append(row_data)
-
     return {
         "type": "table",
         "rows": rows,
@@ -101,16 +181,19 @@ def extract_table_info(table) -> dict:
     }
 
 
-def extract_docx_content(file_bytes: bytes) -> dict:
+def extract_docx_content(file_bytes: bytes) -> tuple[dict, dict[str, bytes]]:
     """
-    Extract structured content from a .docx file while preserving
-    the original order of paragraphs and tables.
+    Returns:
+      content  – structured document (JSON-serialisable)
+      images   – {clean_filename: raw_bytes}  to include in ZIP
     """
     doc = Document(io.BytesIO(file_bytes))
+    rel_to_image = extract_images_from_docx(file_bytes)
+    # flat map: clean_filename → bytes (what the ZIP needs)
+    images_bytes: dict[str, bytes] = {v[0]: v[1] for v in rel_to_image.values()}
 
-    content: dict = {"metadata": {}, "elements": []}
+    content: dict = {"metadata": {}, "elements": [], "image_list": sorted(images_bytes)}
 
-    # Document metadata
     try:
         props = doc.core_properties
         content["metadata"] = {
@@ -121,7 +204,6 @@ def extract_docx_content(file_bytes: bytes) -> dict:
     except Exception:
         pass
 
-    # Build element → object maps so we can look up by XML element
     para_map = {p._element: p for p in doc.paragraphs}
     table_map = {t._element: t for t in doc.tables}
 
@@ -129,14 +211,14 @@ def extract_docx_content(file_bytes: bytes) -> dict:
         tag = child.tag.split("}")[-1] if "}" in child.tag else child.tag
 
         if tag == "p" and child in para_map:
-            info = extract_paragraph_info(para_map[child])
+            info = extract_paragraph_info(para_map[child], rel_to_image)
             if info:
                 content["elements"].append(info)
 
         elif tag == "tbl" and child in table_map:
             content["elements"].append(extract_table_info(table_map[child]))
 
-    return content
+    return content, images_bytes
 
 
 # ---------------------------------------------------------------------------
@@ -145,35 +227,49 @@ def extract_docx_content(file_bytes: bytes) -> dict:
 
 SYSTEM_PROMPT = """\
 You are an expert LaTeX document converter.
-Your job is to convert structured Word document content (provided as JSON) into
-a complete, compilable LaTeX document that reproduces the original as faithfully
-as possible.
+Convert structured Word document content (JSON) into a complete, compilable
+LaTeX document that reproduces the original as faithfully as possible.
 
 Rules:
-1. Choose an appropriate document class (article, report, book) based on content.
-2. Include all necessary packages: inputenc (utf8), fontenc (T1), geometry,
-   hyperref, booktabs (for tables), graphicx, amsmath, etc.
-3. Preserve ALL text formatting: bold → \\textbf{}, italic → \\textit{},
-   underline → \\underline{}, superscript → \\textsuperscript{},
-   subscript → \\textsubscript{}.
-4. Map heading styles: Heading 1 → \\section, Heading 2 → \\subsection,
-   Heading 3 → \\subsubsection, Title → \\title, Subtitle → \\subtitle.
-5. Convert tables to proper LaTeX tabular/booktabs environments with column
-   separators inferred from the data.
-6. Convert bulleted lists to itemize and numbered lists to enumerate.
-7. For quotes use the quotation environment.
-8. If the document contains a References or Bibliography section:
-   a. Extract every reference and create a proper @article/@book/@misc BibTeX entry.
-   b. Detect the citation style (APA, IEEE, MLA, Chicago, Vancouver, …) from
-      the formatting pattern and choose the matching BibTeX style:
-        APA       → apalike
-        IEEE      → ieeetr
-        Vancouver → unsrt
-        MLA/Chicago → plain (or chicago with the chicago package)
-        Numbered   → unsrt
-   c. Insert \\cite{key} in the body text wherever an in-text citation appears.
-9. Handle special characters and accents correctly.
-10. Close the document with \\end{document}.
+1. Choose document class (article / report / book) based on content.
+2. Always include: inputenc (utf8), fontenc (T1), geometry, hyperref,
+   graphicx, booktabs, amsmath, caption, float.
+3. Formatting: bold→\\textbf{}, italic→\\textit{}, underline→\\underline{},
+   superscript→\\textsuperscript{}, subscript→\\textsubscript{}.
+4. Headings: Heading 1→\\section, 2→\\subsection, 3→\\subsubsection,
+   Title→\\title{} + \\maketitle, Subtitle→use \\date{} or subtitle package.
+5. Tables → tabular with booktabs (\\toprule, \\midrule, \\bottomrule).
+6. Bulleted lists → itemize; numbered → enumerate.
+7. Quotes → quotation environment.
+
+8. IMAGES (important):
+   Each element with "type":"image" contains an "images" list of filenames
+   (e.g. ["figure_1.png"]).  These files ARE included in the ZIP alongside
+   the .tex file.
+   For every image element generate:
+
+   \\begin{figure}[H]
+     \\centering
+     \\includegraphics[width=0.8\\linewidth]{figure_1}
+     \\caption{<caption text if next element is a Caption, else leave descriptive placeholder>}
+     \\label{fig:figure_1}
+   \\end{figure}
+
+   - Use the filename WITHOUT extension in \\includegraphics{}.
+   - If the following element has type "caption", use its text and skip it as
+     a standalone paragraph.
+   - If there is no caption, write a short descriptive placeholder like
+     \\caption{Figure extracted from document}.
+   - Always use the float package option [H] so figures stay in place.
+
+9. References / Bibliography:
+   a. Detect citation style (APA→apalike, IEEE→ieeetr, Vancouver→unsrt,
+      MLA/Chicago→plain) and use it.
+   b. Create proper @article/@book/@misc BibTeX entries.
+   c. Insert \\cite{key} in body text for in-text citations.
+
+10. Handle special characters and accents.
+11. Close with \\end{document}.
 """
 
 USER_TEMPLATE = """\
@@ -193,16 +289,12 @@ Respond with EXACTLY this structure — nothing else outside the markers:
 ===BIB_END===
 
 ===BIBSTYLE===
-<BibTeX style name, e.g. apalike / ieeetr / plain / unsrt — or NONE if no references>
+<BibTeX style name: apalike / ieeetr / plain / unsrt — or NONE if no references>
 ===BIBSTYLE_END===
 """
 
 
 def convert_to_latex(content: dict) -> tuple[str, str]:
-    """
-    Call Claude (streaming) to convert extracted document content to LaTeX.
-    Returns (latex_source, bib_source).  bib_source is empty string if no refs.
-    """
     content_json = json.dumps(content, ensure_ascii=False, indent=2)
     user_message = USER_TEMPLATE.format(content_json=content_json)
 
@@ -219,30 +311,21 @@ def convert_to_latex(content: dict) -> tuple[str, str]:
         block.text for block in response.content if block.type == "text"
     )
 
-    # --- Parse markers ---
-    def extract_between(start_tag: str, end_tag: str) -> str:
-        match = re.search(
-            re.escape(start_tag) + r"(.*?)" + re.escape(end_tag),
-            full_text,
-            re.DOTALL,
-        )
-        return match.group(1).strip() if match else ""
+    def extract_between(start: str, end: str) -> str:
+        m = re.search(re.escape(start) + r"(.*?)" + re.escape(end), full_text, re.DOTALL)
+        return m.group(1).strip() if m else ""
 
     latex_content = extract_between("===LATEX_START===", "===LATEX_END===")
-    bib_raw = extract_between("===BIB_START===", "===BIB_END===")
-    bib_style = extract_between("===BIBSTYLE===", "===BIBSTYLE_END===")
+    bib_raw       = extract_between("===BIB_START===",   "===BIB_END===")
+    bib_style     = extract_between("===BIBSTYLE===",     "===BIBSTYLE_END===")
 
     bib_content = "" if bib_raw.upper() == "EMPTY" else bib_raw
     if bib_style.upper() == "NONE":
         bib_style = ""
 
-    # Inject bibliography commands if Claude forgot them
+    # Inject bibliography commands if Claude forgot
     if bib_content and "\\end{document}" in latex_content:
-        has_bib_cmd = (
-            "\\bibliography{" in latex_content
-            or "\\printbibliography" in latex_content
-        )
-        if not has_bib_cmd:
+        if "\\bibliography{" not in latex_content and "\\printbibliography" not in latex_content:
             style_cmd = f"\\bibliographystyle{{{bib_style}}}\n" if bib_style else ""
             latex_content = latex_content.replace(
                 "\\end{document}",
@@ -253,47 +336,36 @@ def convert_to_latex(content: dict) -> tuple[str, str]:
 
 
 # ---------------------------------------------------------------------------
-# FastAPI endpoints
+# FastAPI endpoint
 # ---------------------------------------------------------------------------
 
 @app.post(
     "/convert",
     summary="Convert a Word document to LaTeX",
-    response_description="ZIP archive containing document.tex and (optionally) references.bib",
+    response_description="ZIP: document.tex + references.bib (if any) + all extracted images",
 )
 async def convert_word_to_latex(
     file: UploadFile = File(..., description="Word document (.docx)"),
 ):
-    # --- Validate ---
     if not file.filename:
         raise HTTPException(status_code=400, detail="No filename provided.")
-
     if not file.filename.lower().endswith(".docx"):
-        raise HTTPException(
-            status_code=400,
-            detail="Only .docx files are supported.",
-        )
+        raise HTTPException(status_code=400, detail="Only .docx files are supported.")
 
     file_bytes = await file.read()
     if not file_bytes:
         raise HTTPException(status_code=400, detail="The uploaded file is empty.")
 
-    # --- Extract Word content ---
+    # Extract content + images
     try:
-        content = extract_docx_content(file_bytes)
+        content, images_bytes = extract_docx_content(file_bytes)
     except Exception as exc:
-        raise HTTPException(
-            status_code=422,
-            detail=f"Failed to parse the Word document: {exc}",
-        )
+        raise HTTPException(status_code=422, detail=f"Failed to parse Word document: {exc}")
 
     if not content.get("elements"):
-        raise HTTPException(
-            status_code=422,
-            detail="The document is empty or contains no readable content.",
-        )
+        raise HTTPException(status_code=422, detail="The document is empty or has no readable content.")
 
-    # --- Convert with Claude ---
+    # Convert to LaTeX via Claude
     try:
         latex_content, bib_content = convert_to_latex(content)
     except anthropic.APIError as exc:
@@ -302,21 +374,24 @@ async def convert_word_to_latex(
         raise HTTPException(status_code=500, detail=f"Conversion failed: {exc}")
 
     if not latex_content:
-        raise HTTPException(
-            status_code=500,
-            detail="Claude did not return any LaTeX content.",
-        )
+        raise HTTPException(status_code=500, detail="Claude did not return any LaTeX content.")
 
-    # --- Build ZIP ---
+    # Build ZIP
     zip_buffer = io.BytesIO()
     with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zf:
         zf.writestr("document.tex", latex_content.encode("utf-8"))
+
         if bib_content:
             zf.writestr("references.bib", bib_content.encode("utf-8"))
+
+        # Include every extracted image at the root of the ZIP
+        for img_name, img_data in images_bytes.items():
+            zf.writestr(img_name, img_data)
+
     zip_buffer.seek(0)
 
     base_name = re.sub(r"\.docx$", "", file.filename, flags=re.IGNORECASE)
-    safe_name = re.sub(r"[^\w\-.]", "_", base_name)
+    safe_name  = re.sub(r"[^\w\-.]", "_", base_name)
 
     return StreamingResponse(
         zip_buffer,
@@ -324,6 +399,7 @@ async def convert_word_to_latex(
         headers={
             "Content-Disposition": f'attachment; filename="{safe_name}_latex.zip"',
             "X-Has-Bibliography": "true" if bib_content else "false",
+            "X-Image-Count": str(len(images_bytes)),
         },
     )
 

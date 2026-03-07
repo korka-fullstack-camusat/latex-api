@@ -8,12 +8,32 @@ from typing import Optional
 import anthropic
 from docx import Document
 from docx.oxml.ns import qn
+import os
+
 from fastapi import FastAPI, File, HTTPException, UploadFile
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 
 app = FastAPI(
     title="Word to LaTeX Converter",
     description="Upload a Word document (.docx) and get a compilable LaTeX file + references.bib + images",
+)
+
+# ---------------------------------------------------------------------------
+# CORS — allow the Next.js frontend to call the API from the browser.
+# Set ALLOWED_ORIGINS to a comma-separated list of origins in production,
+# e.g.  ALLOWED_ORIGINS=https://myapp.com,https://www.myapp.com
+# ---------------------------------------------------------------------------
+_raw_origins = os.getenv("ALLOWED_ORIGINS", "http://localhost:3000")
+_allowed_origins = [o.strip() for o in _raw_origins.split(",") if o.strip()]
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=_allowed_origins,
+    allow_methods=["POST", "GET"],
+    allow_headers=["*"],
+    # Expose custom response headers so the browser JS can read them.
+    expose_headers=["Content-Disposition", "X-Has-Bibliography", "X-Image-Count"],
 )
 
 client = anthropic.Anthropic()

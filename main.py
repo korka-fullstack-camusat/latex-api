@@ -359,9 +359,8 @@ def convert_to_latex(content: dict) -> tuple[str, str]:
     user_message = USER_TEMPLATE.format(content_json=content_json)
 
     with client.messages.stream(
-        model="claude-opus-4-6",
+        model="claude-sonnet-4-6",
         max_tokens=16000,
-        thinking={"type": "adaptive"},
         system=SYSTEM_PROMPT,
         messages=[{"role": "user", "content": user_message}],
     ) as stream:

@@ -459,7 +459,7 @@ async def convert_word_to_latex(
 
     if not latex_content:
         # Log first 500 chars to help diagnose future issues
-        preview = full_text[:500].replace("\n", " ") if full_text else "(empty response)"
+        preview = "(empty response)"
         raise HTTPException(
             status_code=500,
             detail=f"Claude did not return any LaTeX content. Response preview: {preview}",

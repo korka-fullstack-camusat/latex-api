@@ -1,52 +1,109 @@
 """
 Generate a test .docx document with:
-  - title, abstract, multiple sections
-  - 3 embedded PNG images (generated with pure Python, no PIL required)
-  - multiple in-text APA citations
-  - a formatted References section in APA style
+  - title + authors at the top
+  - multiple sections with APA citations
+  - 3 real matplotlib charts (bar chart, scatter plot, heatmap)
+  - References / Sources section at the bottom
 """
 import io
-import struct
-import zlib
-import docx
+import numpy as np
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+import matplotlib.cm as cm
+
 from docx import Document
-from docx.shared import Inches, Pt, RGBColor
+from docx.shared import Inches, Pt
 from docx.enum.text import WD_ALIGN_PARAGRAPH
 
 
 # ---------------------------------------------------------------------------
-# Minimal PNG generator (no PIL / Pillow needed)
+# Real chart generators
 # ---------------------------------------------------------------------------
 
-def _png_chunk(chunk_type: bytes, data: bytes) -> bytes:
-    crc = zlib.crc32(chunk_type + data) & 0xFFFFFFFF
-    return struct.pack(">I", len(data)) + chunk_type + data + struct.pack(">I", crc)
+def make_bar_chart() -> bytes:
+    """Pre/post test scores by group — bar chart."""
+    fig, ax = plt.subplots(figsize=(6, 3.5))
+    groups = ["Control\n(n=620)", "Treatment\n(n=620)"]
+    pre  = [60.1, 59.8]
+    post = [65.8, 74.1]
+    x = np.arange(len(groups))
+    w = 0.35
+    bars1 = ax.bar(x - w/2, pre,  w, label="Pre-test",  color="#4C78A8")
+    bars2 = ax.bar(x + w/2, post, w, label="Post-test", color="#F58518")
+    ax.set_ylabel("Mean Score (%)")
+    ax.set_title("Figure 1 — Mean Pre- and Post-Test Scores by Group")
+    ax.set_xticks(x)
+    ax.set_xticklabels(groups)
+    ax.set_ylim(50, 80)
+    ax.legend()
+    ax.bar_label(bars1, fmt="%.1f", padding=3, fontsize=8)
+    ax.bar_label(bars2, fmt="%.1f", padding=3, fontsize=8)
+    ax.spines["top"].set_visible(False)
+    ax.spines["right"].set_visible(False)
+    plt.tight_layout()
+    buf = io.BytesIO()
+    fig.savefig(buf, format="png", dpi=150)
+    plt.close(fig)
+    buf.seek(0)
+    return buf.read()
 
 
-def make_solid_png(width: int, height: int, r: int, g: int, b: int) -> bytes:
-    """Return raw bytes of a solid-colour PNG."""
-    # IHDR
-    ihdr = struct.pack(">IIBBBBB", width, height, 8, 2, 0, 0, 0)
-    # Raw image data: filter byte 0 + RGB pixels per row
-    raw_rows = b""
-    row = bytes([0] + [r, g, b] * width)
-    for _ in range(height):
-        raw_rows += row
-    idat_data = zlib.compress(raw_rows)
-    return (
-        b"\x89PNG\r\n\x1a\n"
-        + _png_chunk(b"IHDR", ihdr)
-        + _png_chunk(b"IDAT", idat_data)
-        + _png_chunk(b"IEND", b"")
-    )
+def make_scatter_plot() -> bytes:
+    """Weekly usage (hours) vs exam score — scatter."""
+    rng = np.random.default_rng(42)
+    hours = rng.uniform(0.5, 10, 200)
+    scores = 45 + 3.2 * hours + rng.normal(0, 7, 200)
+    scores = np.clip(scores, 20, 100)
+
+    fig, ax = plt.subplots(figsize=(6, 3.5))
+    ax.scatter(hours, scores, alpha=0.55, color="#4C78A8", s=25, edgecolors="none")
+    # Regression line
+    m, b = np.polyfit(hours, scores, 1)
+    xline = np.linspace(0.5, 10, 100)
+    ax.plot(xline, m * xline + b, color="#E45756", linewidth=1.8, label=f"r = .47, p < .001")
+    ax.set_xlabel("Weekly Platform Usage (hours)")
+    ax.set_ylabel("Final Examination Score (%)")
+    ax.set_title("Figure 2 — Usage Time vs. Exam Score")
+    ax.legend(fontsize=9)
+    ax.spines["top"].set_visible(False)
+    ax.spines["right"].set_visible(False)
+    plt.tight_layout()
+    buf = io.BytesIO()
+    fig.savefig(buf, format="png", dpi=150)
+    plt.close(fig)
+    buf.seek(0)
+    return buf.read()
 
 
-# Three distinct images
-IMAGES = [
-    ("bar_chart.png",    make_solid_png(400, 220, 70,  130, 200)),   # blue
-    ("scatter_plot.png", make_solid_png(400, 220, 200, 100,  60)),   # orange
-    ("heatmap.png",      make_solid_png(400, 220,  80, 170,  90)),   # green
-]
+def make_heatmap() -> bytes:
+    """Correlation heatmap of key variables."""
+    labels = ["Usage\n(hrs/wk)", "Prior\nGPA", "Feedback\nClicks", "Quiz\nAttempts", "Exam\nScore"]
+    data = np.array([
+        [1.00,  0.12,  0.68,  0.55,  0.47],
+        [0.12,  1.00,  0.08,  0.05,  0.39],
+        [0.68,  0.08,  1.00,  0.61,  0.43],
+        [0.55,  0.05,  0.61,  1.00,  0.38],
+        [0.47,  0.39,  0.43,  0.38,  1.00],
+    ])
+    fig, ax = plt.subplots(figsize=(5.5, 4))
+    im = ax.imshow(data, cmap="RdYlGn", vmin=-1, vmax=1)
+    ax.set_xticks(range(len(labels)))
+    ax.set_yticks(range(len(labels)))
+    ax.set_xticklabels(labels, fontsize=8)
+    ax.set_yticklabels(labels, fontsize=8)
+    for i in range(len(labels)):
+        for j in range(len(labels)):
+            ax.text(j, i, f"{data[i,j]:.2f}", ha="center", va="center",
+                    fontsize=8, color="black")
+    plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+    ax.set_title("Figure 3 — Correlation Matrix of Key Variables")
+    plt.tight_layout()
+    buf = io.BytesIO()
+    fig.savefig(buf, format="png", dpi=150)
+    plt.close(fig)
+    buf.seek(0)
+    return buf.read()
 
 
 # ---------------------------------------------------------------------------
@@ -55,11 +112,11 @@ IMAGES = [
 
 doc = Document()
 
-# ── Title ──────────────────────────────────────────────────────────────────
+# ── Title ───────────────────────────────────────────────────────────────────
 title = doc.add_heading("Impact of Digital Learning Tools on Academic Performance", 0)
 title.alignment = WD_ALIGN_PARAGRAPH.CENTER
 
-# ── Authors / date ─────────────────────────────────────────────────────────
+# ── Authors / date ──────────────────────────────────────────────────────────
 p = doc.add_paragraph("Marie Dupont, Jean-Paul Martin, Amara Diallo")
 p.alignment = WD_ALIGN_PARAGRAPH.CENTER
 p.runs[0].bold = True
@@ -69,7 +126,7 @@ p2.alignment = WD_ALIGN_PARAGRAPH.CENTER
 
 doc.add_paragraph()
 
-# ── Abstract ───────────────────────────────────────────────────────────────
+# ── Abstract ────────────────────────────────────────────────────────────────
 doc.add_heading("Abstract", level=1)
 doc.add_paragraph(
     "This study examines the relationship between the adoption of digital learning "
@@ -81,7 +138,7 @@ doc.add_paragraph(
     "reported by Means et al. (2013)."
 )
 
-# ── 1. Introduction ────────────────────────────────────────────────────────
+# ── 1. Introduction ─────────────────────────────────────────────────────────
 doc.add_heading("1. Introduction", level=1)
 doc.add_paragraph(
     "The rapid expansion of e-learning technologies has reshaped pedagogical "
@@ -99,7 +156,7 @@ doc.add_paragraph(
     "formative-assessment platforms."
 )
 
-# ── 2. Theoretical Framework ───────────────────────────────────────────────
+# ── 2. Theoretical Framework ─────────────────────────────────────────────────
 doc.add_heading("2. Theoretical Framework", level=1)
 doc.add_paragraph(
     "Our conceptual model integrates two complementary theories. First, "
@@ -125,7 +182,7 @@ doc.add_paragraph(
     "(Clark, 1994; Selwyn, 2016)."
 )
 
-# ── 3. Methodology ─────────────────────────────────────────────────────────
+# ── 3. Methodology ───────────────────────────────────────────────────────────
 doc.add_heading("3. Methodology", level=1)
 doc.add_paragraph(
     "We employed a quasi-experimental design with pre- and post-test measurements "
@@ -136,10 +193,11 @@ doc.add_paragraph(
 
 # Image 1 — bar chart
 doc.add_paragraph()
-doc.add_picture(io.BytesIO(IMAGES[0][1]), width=Inches(4.5))
-last = doc.paragraphs[-1]
-last.alignment = WD_ALIGN_PARAGRAPH.CENTER
-cap1 = doc.add_paragraph("Figure 1. Mean pre- and post-test scores by group (treatment vs. control).")
+doc.add_picture(io.BytesIO(make_bar_chart()), width=Inches(5.0))
+doc.paragraphs[-1].alignment = WD_ALIGN_PARAGRAPH.CENTER
+cap1 = doc.add_paragraph(
+    "Figure 1. Mean pre- and post-test scores by group (treatment vs. control)."
+)
 cap1.style = doc.styles["Caption"] if "Caption" in doc.styles else doc.styles["Normal"]
 cap1.alignment = WD_ALIGN_PARAGRAPH.CENTER
 
@@ -149,7 +207,7 @@ doc.add_paragraph(
     "for the control group (Dupont & Martin, 2022)."
 )
 
-# ── 4. Results ─────────────────────────────────────────────────────────────
+# ── 4. Results ───────────────────────────────────────────────────────────────
 doc.add_heading("4. Results", level=1)
 doc.add_paragraph(
     "A two-way repeated-measures ANOVA revealed a significant Group × Time "
@@ -162,9 +220,8 @@ doc.add_paragraph(
 
 # Image 2 — scatter plot
 doc.add_paragraph()
-doc.add_picture(io.BytesIO(IMAGES[1][1]), width=Inches(4.5))
-last = doc.paragraphs[-1]
-last.alignment = WD_ALIGN_PARAGRAPH.CENTER
+doc.add_picture(io.BytesIO(make_scatter_plot()), width=Inches(5.0))
+doc.paragraphs[-1].alignment = WD_ALIGN_PARAGRAPH.CENTER
 cap2 = doc.add_paragraph(
     "Figure 2. Scatter plot of weekly platform usage (hours) vs. final examination score (%)."
 )
@@ -186,16 +243,15 @@ doc.add_paragraph(
 
 # Image 3 — heatmap
 doc.add_paragraph()
-doc.add_picture(io.BytesIO(IMAGES[2][1]), width=Inches(4.5))
-last = doc.paragraphs[-1]
-last.alignment = WD_ALIGN_PARAGRAPH.CENTER
+doc.add_picture(io.BytesIO(make_heatmap()), width=Inches(5.0))
+doc.paragraphs[-1].alignment = WD_ALIGN_PARAGRAPH.CENTER
 cap3 = doc.add_paragraph(
-    "Figure 3. Heatmap of feature correlations: usage metrics, prior GPA, and exam score."
+    "Figure 3. Correlation matrix: usage metrics, prior GPA, feedback clicks, quiz attempts, and exam score."
 )
 cap3.style = doc.styles["Caption"] if "Caption" in doc.styles else doc.styles["Normal"]
 cap3.alignment = WD_ALIGN_PARAGRAPH.CENTER
 
-# ── 5. Discussion ──────────────────────────────────────────────────────────
+# ── 5. Discussion ─────────────────────────────────────────────────────────────
 doc.add_heading("5. Discussion", level=1)
 doc.add_paragraph(
     "Our findings confirm that structured use of digital formative-assessment tools "
@@ -211,7 +267,7 @@ doc.add_paragraph(
     "designs (Sweller, 1988)."
 )
 
-# ── 6. Conclusion ──────────────────────────────────────────────────────────
+# ── 6. Conclusion ─────────────────────────────────────────────────────────────
 doc.add_heading("6. Conclusion", level=1)
 doc.add_paragraph(
     "This study provides quasi-experimental evidence that adaptive digital quizzes "
@@ -221,8 +277,8 @@ doc.add_paragraph(
     "programmes (Zimmerman, 2002; Dupont & Martin, 2022)."
 )
 
-# ── References (APA 7th edition) ───────────────────────────────────────────
-doc.add_heading("References", level=1)
+# ── Sources / References (APA 7th edition) ────────────────────────────────────
+doc.add_heading("Sources", level=1)
 
 refs = [
     ("Clark, R. E. (1994). Media will never influence learning. "

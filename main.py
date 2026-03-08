@@ -442,6 +442,12 @@ Finish the LaTeX document (final part {i} of {n_total}).
 DOCUMENT CONTENT (JSON):
 {content_json}
 
+CRITICAL — This chunk contains the ENTIRE bibliography/references section.
+You MUST convert EVERY SINGLE reference entry — no matter how many there are —
+into a proper BibTeX entry between ===BIB_START=== and ===BIB_END===.
+Do NOT truncate, skip, or summarise any reference. If a reference has partial
+information, use @misc with the available fields.
+
 Respond with EXACTLY this structure:
 
 ===LATEX_CONTINUATION===
@@ -449,10 +455,8 @@ Respond with EXACTLY this structure:
 ===LATEX_CONTINUATION_END===
 
 ===BIB_START===
-<ALL BibTeX entries converted from every reference visible in THIS chunk.
- This chunk contains the bibliography/references section of the document.
- Convert EVERY item in the reference list to a proper BibTeX entry.
- If there are truly NO references, write only: EMPTY>
+<ALL BibTeX entries — one @article/@book/@inproceedings/@misc/@online block per reference.
+ Convert EVERY reference item in the list. Do NOT write EMPTY if references exist.>
 ===BIB_END===
 
 ===BIBSTYLE===
@@ -703,16 +707,23 @@ async def _convert_chunked(content: dict, template: str = "auto") -> tuple[str, 
     metadata     = content.get("metadata", {})
     image_list   = content.get("image_list", [])
 
-    # Always keep the references section in the last chunk so Claude can
-    # generate complete BibTeX regardless of how the document is split.
+    # Always keep the references section in its own dedicated last chunk so
+    # Claude is never forced to generate hundreds of BibTeX entries while also
+    # processing unrelated body content — which causes truncation on long lists.
     body_elements, ref_elements = _find_references_section(all_elements)
     chunks = _chunk_elements(body_elements)
 
     if ref_elements:
-        if chunks:
-            chunks[-1] = chunks[-1] + ref_elements
-        else:
-            chunks = [ref_elements]
+        # If the reference section itself is large, split it into sub-chunks
+        # but keep ALL of them at the end so they are processed by the last call.
+        ref_chunks = _chunk_elements(ref_elements)
+        # Merge all ref sub-chunks into a single block to keep one BIB_START/END
+        # marker; for very large ref lists we still use a single last call but
+        # with increased max_tokens (16 000).
+        merged_refs = [elem for rc in ref_chunks for elem in rc]
+        chunks.append(merged_refs)
+    elif not chunks:
+        chunks = [all_elements]
 
     n = len(chunks)
     if n == 1:
@@ -749,10 +760,10 @@ async def _convert_chunked(content: dict, template: str = "auto") -> tuple[str, 
             _MIDDLE_CHUNK_TEMPLATE.format(i=i, n_total=n, content_json=_chunk_json(chunk)),
             max_tokens=6000, template=template, model=_MODEL_FAST,
         ))
-    # Last chunk
+    # Last chunk — more tokens to handle documents with many references
     tasks.append(_call_claude_async(
         _LAST_CHUNK_TEMPLATE.format(i=n, n_total=n, content_json=_chunk_json(chunks[-1])),
-        max_tokens=8000, template=template, model=_MODEL_SMART,
+        max_tokens=16000, template=template, model=_MODEL_SMART,
     ))
 
     results: list[str] = await asyncio.gather(*tasks)

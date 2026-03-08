@@ -314,22 +314,37 @@ Rules:
       \\caption{Figure extracted from document}.
     - Always use the float package option [H] so figures stay in place.
 
-11. References / Bibliography:
-    a. Detect citation style from the references section of the document.
-    b. Create proper @article/@book/@misc BibTeX entries.
+11. References / Bibliography — CRITICAL RULES:
+    a. NEVER use \\begin{thebibliography}...\\end{thebibliography} in the LaTeX
+       document. ALWAYS use an external BibTeX file referenced via
+       \\bibliography{references}. Every single reference entry MUST appear
+       between ===BIB_START=== and ===BIB_END=== as proper BibTeX.
 
-    c. APA style (most common — Author, Year format):
+    b. Convert EVERY reference found in the document — whether it appears as a
+       numbered list, an author-year list, a bulleted list, or any other format —
+       into a @article, @book, @inproceedings, @misc, or @online BibTeX entry.
+       If you can only determine partial information, use @misc with as many
+       fields as possible. Do NOT leave any reference unconverted.
+
+    c. Detect citation style from the references section of the document.
+
+    d. APA style (most common — Author, Year format):
        - ALWAYS add \\usepackage[round,authoryear]{natbib} to the preamble.
        - Use bibliographystyle{apalike}.
        - In-text parenthetical citation  → \\citep{key}   → produces (Author, Year)
        - In-text narrative citation       → \\citet{key}   → produces Author (Year)
        - NEVER use plain \\cite{} for APA; it produces [key] which is wrong.
 
-    d. IEEE / numeric styles (ieeetr, unsrt, plain):
+    e. IEEE / numeric styles (ieeetr, unsrt, plain):
        - Do NOT add natbib.
        - Use plain \\cite{key} → produces [1], [2], …
 
-    e. Default to APA/natbib if the citation style cannot be determined.
+    f. Default to APA/natbib if the citation style cannot be determined.
+
+    g. In the LaTeX body, replace the original reference list with:
+       \\bibliographystyle{apalike}   % or ieeetr / plain etc.
+       \\bibliography{references}
+       (do NOT reproduce the references as plain text in the document body)
 
 12. Handle special characters and accents.
 13. Close with \\end{document}.
@@ -369,7 +384,9 @@ Respond with EXACTLY this structure — nothing else outside the markers:
 ===LATEX_END===
 
 ===BIB_START===
-<BibTeX entries, or the single word EMPTY if there are no references>
+<ALL BibTeX entries converted from every reference in the document.
+ Use @article/@book/@inproceedings/@misc/@online as appropriate.
+ If there are truly NO references anywhere in the document, write only: EMPTY>
 ===BIB_END===
 
 ===BIBSTYLE===
@@ -421,7 +438,10 @@ Respond with EXACTLY this structure:
 ===LATEX_CONTINUATION_END===
 
 ===BIB_START===
-<BibTeX entries, or the single word EMPTY if there are no references>
+<ALL BibTeX entries converted from every reference visible in THIS chunk.
+ This chunk contains the bibliography/references section of the document.
+ Convert EVERY item in the reference list to a proper BibTeX entry.
+ If there are truly NO references, write only: EMPTY>
 ===BIB_END===
 
 ===BIBSTYLE===
@@ -496,11 +516,71 @@ async def _call_claude_async(user_message: str, max_tokens: int = 8000, template
         return await asyncio.to_thread(_call_claude_sync, user_message, max_tokens, template)
 
 
-def _postprocess(latex_content: str, bib_raw: str, bib_style: str, citation_type: str) -> tuple[str, str]:
-    """Inject bibliography and fix APA citations."""
+_BIBTEX_ENTRY_RE = re.compile(
+    r'(@(?:article|book|inproceedings|proceedings|incollection|misc|'
+    r'online|url|phdthesis|mastersthesis|techreport|conference)\s*\{[^@]+\})',
+    re.DOTALL | re.IGNORECASE,
+)
+
+
+def _extract_bibtex_fallback(text: str) -> str:
+    """Extract any BibTeX entries present anywhere in the raw Claude response."""
+    entries = _BIBTEX_ENTRY_RE.findall(text)
+    return "\n\n".join(e.strip() for e in entries)
+
+
+def _thebibliography_to_bibtex(latex: str) -> tuple[str, str]:
+    """If Claude generated \\begin{thebibliography} in the .tex, convert each
+    \\bibitem to a minimal @misc entry and remove the environment from the .tex.
+    Returns (cleaned_latex, extra_bib_entries).
+    """
+    m = re.search(
+        r'\\begin\{thebibliography\}.*?\\end\{thebibliography\}',
+        latex, re.DOTALL,
+    )
+    if not m:
+        return latex, ""
+
+    block = m.group(0)
+    items = re.findall(r'\\bibitem(?:\[.*?\])?\{([^}]+)\}(.*?)(?=\\bibitem|\Z)', block, re.DOTALL)
+    bib_entries = []
+    for key, body in items:
+        body_clean = re.sub(r'\s+', ' ', body).strip()
+        bib_entries.append(
+            f"@misc{{{key},\n  note = {{{body_clean}}},\n}}"
+        )
+
+    cleaned = latex[:m.start()] + "\\bibliography{references}\n" + latex[m.end():]
+    return cleaned, "\n\n".join(bib_entries)
+
+
+def _postprocess(latex_content: str, bib_raw: str, bib_style: str, citation_type: str,
+                 raw_response: str = "") -> tuple[str, str]:
+    """Inject bibliography and fix APA citations.
+
+    Priority for BibTeX content:
+    1. Between ===BIB_START=== / ===BIB_END=== markers
+    2. @article/@book/... entries found anywhere in the raw response
+    3. \\begin{thebibliography} converted to @misc entries
+    """
+    bib_raw = bib_raw.strip()
+    bib_style = bib_style.strip()
+    citation_type = citation_type.strip().lower()
+
     bib_content = "" if bib_raw.upper() == "EMPTY" else bib_raw
     if bib_style.upper() == "NONE":
         bib_style = ""
+
+    # Fallback 1: scan entire raw response for BibTeX entries
+    if not bib_content and raw_response:
+        bib_content = _extract_bibtex_fallback(raw_response)
+
+    # Fallback 2: convert \begin{thebibliography} if still nothing
+    if not bib_content:
+        latex_content, bib_content = _thebibliography_to_bibtex(latex_content)
+    elif "\\begin{thebibliography}" in latex_content:
+        # We have BibTeX — strip the thebibliography block from .tex
+        latex_content, _ = _thebibliography_to_bibtex(latex_content)
 
     is_apa = "apa" in citation_type or bib_style == "apalike"
 
@@ -532,15 +612,20 @@ _REF_HEADINGS = {
 def _find_references_section(elements: list) -> tuple[list, list]:
     """Split elements into (body_elements, references_elements).
 
-    Searches from the end for a heading whose text (lowercased, stripped)
-    is a known bibliography keyword.  Everything from that heading onward
-    is returned as the references section so the last Claude chunk always
-    receives it and can generate proper BibTeX entries.
+    Searches from the end for a heading/paragraph whose text starts with or
+    equals a known bibliography keyword (case-insensitive, accent-insensitive).
+    Everything from that element onward goes to the last chunk so Claude always
+    sees the full reference list when generating BibTeX.
     """
+    def _normalise(t: str) -> str:
+        import unicodedata
+        return unicodedata.normalize("NFD", t).encode("ascii", "ignore").decode().lower().strip()
+
     for i in range(len(elements) - 1, -1, -1):
         elem = elements[i]
         if elem.get("type") in ("heading", "paragraph"):
-            if elem.get("text", "").strip().lower() in _REF_HEADINGS:
+            t = _normalise(elem.get("text", ""))
+            if any(t == h or t.startswith(h) for h in _REF_HEADINGS):
                 return elements[:i], elements[i:]   # heading stays with refs
     return elements, []
 
@@ -582,7 +667,7 @@ async def _convert_single(content: dict, template: str = "auto") -> tuple[str, s
         if m:
             latex_content = m.group(1).strip()
 
-    latex_content, bib_content = _postprocess(latex_content, bib_raw, bib_style, citation_type)
+    latex_content, bib_content = _postprocess(latex_content, bib_raw, bib_style, citation_type, full_text)
     return latex_content, bib_content, full_text
 
 
@@ -677,8 +762,9 @@ async def _convert_chunked(content: dict, template: str = "auto") -> tuple[str, 
     if "\\end{document}" not in latex_content:
         latex_content += "\n\\end{document}"
 
-    latex_content, bib_content = _postprocess(latex_content, bib_raw, bib_style, citation_type)
-    return latex_content, bib_content, "\n\n---CHUNK BREAK---\n\n".join(all_raw)
+    full_raw = "\n\n---CHUNK BREAK---\n\n".join(all_raw)
+    latex_content, bib_content = _postprocess(latex_content, bib_raw, bib_style, citation_type, full_raw)
+    return latex_content, bib_content, full_raw
 
 
 async def convert_to_latex(content: dict, template: str = "auto") -> tuple[str, str, str]:

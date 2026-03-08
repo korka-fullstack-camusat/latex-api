@@ -765,7 +765,7 @@ def _postprocess(latex_content: str, bib_raw: str, bib_style: str, citation_type
             # biblatex: replace \bibliography{} with \printbibliography
             latex_content = re.sub(
                 r'\\bibliographystyle\{[^}]*\}\s*\n?\\bibliography\{[^}]*\}',
-                '\\printbibliography',
+                r'\\printbibliography',
                 latex_content,
             )
             if "\\printbibliography" not in latex_content:

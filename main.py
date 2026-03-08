@@ -206,11 +206,29 @@ def extract_table_info(table) -> dict:
             for cell in row.cells
         ]
         rows.append(row_data)
+
+    num_cols = len(rows[0]) if rows else 0
+    num_rows = len(rows)
+
+    # Compute max content length per column to help Claude choose alignment
+    col_max_len = [0] * num_cols
+    for row in rows:
+        for i, cell in enumerate(row):
+            if i < num_cols:
+                col_max_len[i] = max(col_max_len[i], len(cell))
+
+    # Flag wide tables (many columns or long cell content) so Claude
+    # knows it MUST use \adjustbox to prevent overflow
+    total_content = sum(col_max_len)
+    is_wide = num_cols >= 5 or total_content > 120
+
     return {
         "type": "table",
         "rows": rows,
-        "num_cols": len(rows[0]) if rows else 0,
-        "num_rows": len(rows),
+        "num_cols": num_cols,
+        "num_rows": num_rows,
+        "col_max_lengths": col_max_len,
+        "is_wide": is_wide,
     }
 
 
@@ -271,6 +289,8 @@ Rules:
    \\usepackage[margin=2.5cm]{geometry}
    \\usepackage{graphicx}
    \\usepackage{booktabs}
+   \\usepackage{tabularx}
+   \\usepackage{adjustbox}
    \\usepackage{amsmath}
    \\usepackage{caption}
    \\usepackage{float}
@@ -301,7 +321,35 @@ Rules:
    superscript→\\textsuperscript{}, subscript→\\textsubscript{}.
 7. Headings: Heading 1→\\section, 2→\\subsection, 3→\\subsubsection,
    Title→\\title{} + \\maketitle, Subtitle→use \\date{} or subtitle package.
-8. Tables → tabular with booktabs (\\toprule, \\midrule, \\bottomrule).
+8. TABLES — FULL WIDTH (mandatory):
+   Every table MUST occupy the full text width. Use this exact structure:
+
+   \\begin{table}[H]
+     \\centering
+     \\caption{<caption or description>}
+     \\label{tab:X}
+     \\adjustbox{max width=\\linewidth}{%
+       \\begin{tabular}{l c c ...}   % one letter per column
+         \\toprule
+         Col1 & Col2 & ... \\\\
+         \\midrule
+         val  & val  & ... \\\\
+         \\bottomrule
+       \\end{tabular}%
+     }
+   \\end{table}
+
+   Rules:
+   - ALWAYS wrap the inner tabular with \\adjustbox{max width=\\linewidth}{...}.
+     This automatically shrinks wide tables to fit the page and leaves
+     narrow tables at their natural width.
+   - ALWAYS place tables in \\begin{table}[H]...\\end{table} with \\centering.
+   - ALWAYS add \\caption{} and \\label{tab:N} (N = sequential number).
+   - Use booktabs rules: \\toprule, \\midrule, \\bottomrule. Never use \\hline.
+   - Column alignment: l (left) for text, c (center) for short values,
+     r (right) for numbers. Choose sensibly based on content.
+   - NEVER use tabularx or hard-coded widths like p{3cm}; plain tabular
+     inside \\adjustbox handles everything automatically.
 9. Bulleted lists → itemize; numbered → enumerate.
 10. Quotes → quotation environment.
 
@@ -356,6 +404,29 @@ Rules:
        \\bibliographystyle{apalike}   % or ieeetr / plain etc.
        \\bibliography{references}
        (do NOT reproduce the references as plain text in the document body)
+
+    h. IN-TEXT CITATION REPLACEMENT — MANDATORY:
+       Scan every paragraph text for citation patterns and replace them with
+       proper LaTeX commands. The BibTeX key you assign MUST match exactly.
+
+       APA patterns to detect and replace:
+         (Author, Year)            → \\citep{Author_Year}
+         (Author et al., Year)     → \\citep{Author_etal_Year}
+         Author (Year)             → \\citet{Author_Year}
+         Author et al. (Year)      → \\citet{Author_etal_Year}
+         (Author1, Year; Author2, Year) → \\citep{Author1_Year,Author2_Year}
+
+       Numeric patterns to detect and replace:
+         [1]   [2,3]   [1-4]   → \\cite{ref1}  \\cite{ref2,ref3}  etc.
+         Superscript numbers (run.superscript) referencing a numbered list →
+         \\cite{refN}
+
+       Key naming convention (use consistently in BibTeX and \\cite):
+         - APA: FirstAuthorLastname_Year  (e.g., Smith_2020, Jones_etal_2019)
+         - Numeric: ref1, ref2, … (matching the order in the reference list)
+
+       NEVER leave original citation text like "(Smith, 2020)" or "[1]" in the
+       LaTeX output — always replace with the correct \\citep / \\citet / \\cite.
 
 13. Handle special characters and accents.
 14. Close with \\end{document}.

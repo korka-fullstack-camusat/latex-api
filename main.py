@@ -405,28 +405,40 @@ Rules:
        \\bibliography{references}
        (do NOT reproduce the references as plain text in the document body)
 
-    h. IN-TEXT CITATION REPLACEMENT — MANDATORY:
-       Scan every paragraph text for citation patterns and replace them with
-       proper LaTeX commands. The BibTeX key you assign MUST match exactly.
+    h. TWO-PASS CITATION PROCESSING — MANDATORY:
 
-       APA patterns to detect and replace:
-         (Author, Year)            → \\citep{Author_Year}
-         (Author et al., Year)     → \\citep{Author_etal_Year}
-         Author (Year)             → \\citet{Author_Year}
-         Author et al. (Year)      → \\citet{Author_etal_Year}
-         (Author1, Year; Author2, Year) → \\citep{Author1_Year,Author2_Year}
+       ══ PASS 1 — Build the citation key map from the references section ══
+       Before writing any body LaTeX, read the entire references section and
+       assign a unique BibTeX key to EVERY reference entry:
+         - APA style  → key = FirstAuthorLastname_Year
+                        (e.g. "Smith_2020", "Jones_etal_2019")
+         - Numeric    → key = ref1, ref2, ref3, … (matching list order)
+       Write these keys consistently in both the BibTeX entries AND every
+       in-text \\cite command. The keys in ===BIB_START=== / ===BIB_END===
+       MUST be identical to those used in the body.
 
-       Numeric patterns to detect and replace:
-         [1]   [2,3]   [1-4]   → \\cite{ref1}  \\cite{ref2,ref3}  etc.
-         Superscript numbers (run.superscript) referencing a numbered list →
-         \\cite{refN}
+       ══ PASS 2 — Replace every in-text citation in the body ══
+       Walk through each paragraph. Every citation pattern MUST be replaced
+       with the matching LaTeX command — NEVER leave raw "(Author, Year)"
+       or "[1]" text in the output.
 
-       Key naming convention (use consistently in BibTeX and \\cite):
-         - APA: FirstAuthorLastname_Year  (e.g., Smith_2020, Jones_etal_2019)
-         - Numeric: ref1, ref2, … (matching the order in the reference list)
+       ● Single citation:
+         APA  : (Smith, 2020)          →  \\citep{Smith_2020}
+                Smith (2020)           →  \\citet{Smith_2020}
+                Smith et al. (2020)    →  \\citet{Smith_etal_2020}
+         Num  : [1]                    →  \\cite{ref1}
+         Super: ¹  (superscript run)   →  \\cite{ref1}
 
-       NEVER leave original citation text like "(Smith, 2020)" or "[1]" in the
-       LaTeX output — always replace with the correct \\citep / \\citet / \\cite.
+       ● Multiple citations grouped at the same location
+         (use ONE command with comma-separated keys, NOT separate commands):
+         APA  : (Smith, 2020; Jones, 2019)      →  \\citep{Smith_2020, Jones_2019}
+                (Smith, 2020; Jones et al., 2018) → \\citep{Smith_2020, Jones_etal_2018}
+         Num  : [1,2]  or  [1][2]  or  ¹²       →  \\cite{ref1, ref2}
+                [1-3]  (range)                   →  \\cite{ref1, ref2, ref3}
+
+       ● NEVER use \\cites (that is biblatex, not natbib).
+       ● NEVER emit two separate \\citep{}\\citep{} side by side;
+         always merge into \\citep{key1, key2, key3}.
 
 13. Handle special characters and accents.
 14. Close with \\end{document}.
@@ -486,9 +498,11 @@ Convert the following Word document content to LaTeX (part 1 of {n_total}).
 
 DOCUMENT CONTENT (JSON):
 {content_json}
-
+{key_map_hint}
 Generate the complete LaTeX preamble and body for these elements.
 Do NOT include \\end{{document}} — more content follows in subsequent parts.
+Replace every in-text citation using the KEY MAP above (if provided).
+Use \\citep{{k1, k2}} for grouped citations — ONE command, comma-separated keys.
 
 Respond with EXACTLY:
 
@@ -502,9 +516,49 @@ Continue the LaTeX document (part {i} of {n_total}).
 
 DOCUMENT CONTENT (JSON):
 {content_json}
-
+{key_map_hint}
 Output ONLY the raw LaTeX body lines for these elements.
 No \\documentclass, no preamble, no \\end{{document}}, no markers.
+Replace every in-text citation using the KEY MAP above (if provided).
+Use \\citep{{k1, k2}} for grouped citations — ONE command, comma-separated keys.
+"""
+
+# Pre-pass template: extract key map + BibTeX from the references section only.
+# Run BEFORE the body chunks so body chunks can replace citations correctly.
+_REF_MAP_TEMPLATE = """\
+You are given ONLY the references/bibliography section of a Word document (JSON).
+
+REFERENCES CONTENT (JSON):
+{content_json}
+
+Your task:
+1. Assign a unique BibTeX key to every reference entry.
+   - APA style  → FirstAuthorLastname_Year  (e.g. Smith_2020, Jones_etal_2019)
+   - Numeric    → ref1, ref2, ref3, … (in list order)
+2. Output the citation-key map AND the full BibTeX entries.
+
+Respond with EXACTLY this structure:
+
+===KEY_MAP_START===
+<JSON object: each key is the ORIGINAL citation identifier as it appears in the
+ document body (e.g. "Smith, 2020" / "Smith et al., 2020" / "1" / "2"), and
+ each value is the BibTeX key you assigned.
+ Example APA  : {{"Smith, 2020": "Smith_2020", "Jones et al., 2019": "Jones_etal_2019"}}
+ Example Numeric: {{"1": "ref1", "2": "ref2", "3": "ref3"}}>
+===KEY_MAP_END===
+
+===BIB_START===
+<ALL BibTeX entries — one @article/@book/@inproceedings/@misc/@online per reference.
+ Convert EVERY reference. Do NOT skip or summarise any.>
+===BIB_END===
+
+===BIBSTYLE===
+<apalike / ieeetr / plain / unsrt>
+===BIBSTYLE_END===
+
+===CITATION_TYPE===
+<apa_natbib or numeric>
+===CITATION_TYPE_END===
 """
 
 _LAST_CHUNK_TEMPLATE = """\
@@ -773,45 +827,96 @@ async def _convert_single(content: dict, template: str = "auto",
     return latex_content, bib_content, full_text
 
 
+async def _extract_ref_map(ref_elements: list, template: str,
+                           model: str) -> tuple[dict, str, str, str, str]:
+    """Pre-pass: process the references section first to get the BibTeX key
+    map, the full .bib content, and citation style metadata.
+
+    Returns (key_map, bib_raw, bib_style, citation_type, raw_response).
+    key_map = {original_citation_text: bibtex_key}
+    """
+    content_json = json.dumps(
+        {"metadata": {}, "elements": ref_elements, "image_list": []},
+        ensure_ascii=False, indent=2,
+    )
+    raw = await _call_claude_async(
+        _REF_MAP_TEMPLATE.format(content_json=content_json),
+        max_tokens=8000, template=template, model=model,
+    )
+    key_map_raw   = _extract_between(raw, "===KEY_MAP_START===", "===KEY_MAP_END===")
+    bib_raw       = _extract_between(raw, "===BIB_START===",     "===BIB_END===")
+    bib_style     = _extract_between(raw, "===BIBSTYLE===",       "===BIBSTYLE_END===")
+    citation_type = _extract_between(raw, "===CITATION_TYPE===",  "===CITATION_TYPE_END===").lower()
+
+    try:
+        key_map: dict = json.loads(key_map_raw) if key_map_raw else {}
+    except json.JSONDecodeError:
+        key_map = {}
+
+    # Fallback: scan for BibTeX entries if markers missed
+    if not bib_raw:
+        bib_raw = _extract_bibtex_fallback(raw)
+
+    return key_map, bib_raw, bib_style, citation_type, raw
+
+
+def _format_key_map_hint(key_map: dict) -> str:
+    """Format the citation key map as a readable hint to inject into prompts."""
+    if not key_map:
+        return ""
+    lines = [
+        "CITATION KEY MAP — replace every in-text citation using these keys:",
+        "(grouped citations → ONE \\citep{k1, k2} command, comma-separated)",
+    ]
+    for original, key in key_map.items():
+        lines.append(f'  "{original}" → {key}')
+    return "\n" + "\n".join(lines) + "\n"
+
+
 async def _convert_chunked(content: dict, template: str = "auto") -> tuple[str, str, str]:
     all_elements = content.get("elements", [])
     metadata     = content.get("metadata", {})
     image_list   = content.get("image_list", [])
 
-    # Always keep the references section in its own dedicated last chunk so
-    # Claude is never forced to generate hundreds of BibTeX entries while also
-    # processing unrelated body content — which causes truncation on long lists.
     body_elements, ref_elements = _find_references_section(all_elements)
-    chunks = _chunk_elements(body_elements)
+
+    # -----------------------------------------------------------------------
+    # PRE-PASS: if the document has a references section, process it FIRST
+    # (sequential, before body chunks) to build the citation key map.
+    # Body chunks then receive the key map so they can replace every in-text
+    # citation correctly, including grouped multi-citations.
+    # -----------------------------------------------------------------------
+    key_map: dict        = {}
+    bib_raw: str         = ""
+    bib_style: str       = ""
+    citation_type: str   = ""
+    pre_pass_raw: str    = ""
 
     if ref_elements:
-        # If the reference section itself is large, split it into sub-chunks
-        # but keep ALL of them at the end so they are processed by the last call.
-        ref_chunks = _chunk_elements(ref_elements)
-        # Merge all ref sub-chunks into a single block to keep one BIB_START/END
-        # marker; for very large ref lists we still use a single last call but
-        # with increased max_tokens (16 000).
-        merged_refs = [elem for rc in ref_chunks for elem in rc]
-        chunks.append(merged_refs)
-    elif not chunks:
+        key_map, bib_raw, bib_style, citation_type, pre_pass_raw = \
+            await _extract_ref_map(ref_elements, template, _MODEL_SMART)
+
+    key_map_hint = _format_key_map_hint(key_map)
+
+    # -----------------------------------------------------------------------
+    # Split body elements into chunks and convert them ALL in parallel.
+    #
+    # Strategy:
+    #   chunk[0]       → _FIRST_CHUNK_TEMPLATE  → _MODEL_SMART (preamble)
+    #   chunk[1..n-2]  → _MIDDLE_CHUNK_TEMPLATE → _MODEL_FAST  (body, Haiku)
+    #   chunk[n-1]     → _LAST_CHUNK_TEMPLATE   → _MODEL_SMART (closing + bib)
+    #
+    # Every chunk receives key_map_hint so citations are replaced uniformly.
+    # -----------------------------------------------------------------------
+    chunks = _chunk_elements(body_elements) if body_elements else [all_elements]
+
+    # If there are no body elements (doc is only a reference list), fall back
+    if not chunks:
         chunks = [all_elements]
 
     n = len(chunks)
-    if n == 1:
+    if n == 1 and not ref_elements:
         return await _convert_single(content, template)
-
-    # -----------------------------------------------------------------------
-    # Build one prompt per chunk, then fire ALL in parallel.
-    #
-    # Strategy:
-    #   chunk[0]   → _FIRST_CHUNK_TEMPLATE  → _MODEL_SMART (preamble + packages)
-    #   chunk[1..n-2] → _MIDDLE_CHUNK_TEMPLATE → _MODEL_FAST  (body only, Haiku)
-    #   chunk[n-1] → _LAST_CHUNK_TEMPLATE   → _MODEL_SMART (BibTeX + closing)
-    #
-    # Since every chunk is independent (no chunk reads the output of another),
-    # they can all run simultaneously.  Total wall-clock time ≈ slowest chunk
-    # instead of sum of all chunks.
-    # -----------------------------------------------------------------------
 
     def _chunk_json(elements, meta=None, imgs=None):
         return json.dumps(
@@ -820,21 +925,32 @@ async def _convert_chunked(content: dict, template: str = "auto") -> tuple[str, 
         )
 
     tasks = []
-    # First chunk
+    # First chunk — preamble
     tasks.append(_call_claude_async(
-        _FIRST_CHUNK_TEMPLATE.format(n_total=n, content_json=_chunk_json(chunks[0], metadata, image_list)),
+        _FIRST_CHUNK_TEMPLATE.format(
+            n_total=n,
+            content_json=_chunk_json(chunks[0], metadata, image_list),
+            key_map_hint=key_map_hint,
+        ),
         max_tokens=8000, template=template, model=_MODEL_SMART,
     ))
     # Middle chunks — Haiku (fast, body-text only)
     for i, chunk in enumerate(chunks[1:-1], start=2):
         tasks.append(_call_claude_async(
-            _MIDDLE_CHUNK_TEMPLATE.format(i=i, n_total=n, content_json=_chunk_json(chunk)),
+            _MIDDLE_CHUNK_TEMPLATE.format(
+                i=i, n_total=n,
+                content_json=_chunk_json(chunk),
+                key_map_hint=key_map_hint,
+            ),
             max_tokens=6000, template=template, model=_MODEL_FAST,
         ))
-    # Last chunk — more tokens to handle documents with many references
+    # Last body chunk — closing; BibTeX already handled by pre-pass
     tasks.append(_call_claude_async(
-        _LAST_CHUNK_TEMPLATE.format(i=n, n_total=n, content_json=_chunk_json(chunks[-1])),
-        max_tokens=16000, template=template, model=_MODEL_SMART,
+        _LAST_CHUNK_TEMPLATE.format(
+            i=n, n_total=n,
+            content_json=_chunk_json(chunks[-1]),
+        ),
+        max_tokens=8000, template=template, model=_MODEL_SMART,
     ))
 
     results: list[str] = await asyncio.gather(*tasks)
@@ -853,21 +969,28 @@ async def _convert_chunked(content: dict, template: str = "auto") -> tuple[str, 
     for text in middle_texts:
         latex_body += "\n\n" + text.strip()
 
-    last_body     = _extract_between(last_text, "===LATEX_CONTINUATION===", "===LATEX_CONTINUATION_END===")
-    bib_raw       = _extract_between(last_text, "===BIB_START===",          "===BIB_END===")
-    bib_style     = _extract_between(last_text, "===BIBSTYLE===",            "===BIBSTYLE_END===")
-    citation_type = _extract_between(last_text, "===CITATION_TYPE===",       "===CITATION_TYPE_END===").lower()
-
+    last_body = _extract_between(last_text, "===LATEX_CONTINUATION===", "===LATEX_CONTINUATION_END===")
     if not last_body:
         last_body = last_text.strip()
+    # Strip \end{document} — _postprocess will add bibliography + \end{document}
+    last_body = re.sub(r'\\end\{document\}\s*$', '', last_body).rstrip()
+
+    # If pre-pass produced BibTeX, use it; otherwise fall back to last-chunk markers
+    if not bib_raw:
+        bib_raw       = _extract_between(last_text, "===BIB_START===",   "===BIB_END===")
+        bib_style     = _extract_between(last_text, "===BIBSTYLE===",     "===BIBSTYLE_END===")
+        citation_type = _extract_between(last_text, "===CITATION_TYPE===","===CITATION_TYPE_END===").lower()
 
     latex_content = latex_body + "\n\n" + last_body
     if "\\end{document}" not in latex_content:
         latex_content += "\n\\end{document}"
 
-    full_raw = "\n\n---CHUNK BREAK---\n\n".join(results)
-    latex_content, bib_content = _postprocess(latex_content, bib_raw, bib_style, citation_type, full_raw)
-    return latex_content, bib_content, full_raw
+    all_raw = pre_pass_raw + "\n\n---CHUNK BREAK---\n\n" + \
+              "\n\n---CHUNK BREAK---\n\n".join(results)
+    latex_content, bib_content = _postprocess(
+        latex_content, bib_raw, bib_style, citation_type, all_raw
+    )
+    return latex_content, bib_content, all_raw
 
 
 async def convert_to_latex(content: dict, template: str = "auto") -> tuple[str, str, str]:

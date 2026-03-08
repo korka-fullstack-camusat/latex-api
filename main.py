@@ -1,3 +1,4 @@
+import asyncio
 import io
 import re
 import json
@@ -38,6 +39,11 @@ app.add_middleware(
 )
 
 client = anthropic.Anthropic()
+
+# Limit concurrent Claude API calls to protect against rate-limit bursts.
+# At 1000 simultaneous users most requests wait in queue rather than
+# hammering the API and getting 429s.
+_API_SEMAPHORE = asyncio.Semaphore(20)
 
 
 # ---------------------------------------------------------------------------
@@ -447,7 +453,8 @@ def _extract_between(text: str, start: str, end: str) -> str:
     return m.group(1).strip() if m else ""
 
 
-def _call_claude(user_message: str, max_tokens: int = 8000, template: str = "auto") -> str:
+def _call_claude_sync(user_message: str, max_tokens: int = 8000, template: str = "auto") -> str:
+    """Blocking Claude call — run inside a thread via _call_claude_async."""
     system = SYSTEM_PROMPT
     if template in _TEMPLATE_HINTS:
         system = system + f"\n\nTEMPLATE OVERRIDE: {_TEMPLATE_HINTS[template]}"
@@ -479,6 +486,16 @@ def _call_claude(user_message: str, max_tokens: int = 8000, template: str = "aut
     raise last_exc
 
 
+async def _call_claude_async(user_message: str, max_tokens: int = 8000, template: str = "auto") -> str:
+    """Non-blocking wrapper: runs the sync Claude call in a thread pool.
+
+    The global semaphore caps concurrent API calls so we never flood the
+    Anthropic API regardless of how many HTTP requests FastAPI is handling.
+    """
+    async with _API_SEMAPHORE:
+        return await asyncio.to_thread(_call_claude_sync, user_message, max_tokens, template)
+
+
 def _postprocess(latex_content: str, bib_raw: str, bib_style: str, citation_type: str) -> tuple[str, str]:
     """Inject bibliography and fix APA citations."""
     bib_content = "" if bib_raw.upper() == "EMPTY" else bib_raw
@@ -506,6 +523,28 @@ def _postprocess(latex_content: str, bib_raw: str, bib_style: str, citation_type
     return latex_content, bib_content
 
 
+_REF_HEADINGS = {
+    "references", "bibliography", "bibliographie", "références",
+    "works cited", "literature", "sources", "liste de références",
+}
+
+
+def _find_references_section(elements: list) -> tuple[list, list]:
+    """Split elements into (body_elements, references_elements).
+
+    Searches from the end for a heading whose text (lowercased, stripped)
+    is a known bibliography keyword.  Everything from that heading onward
+    is returned as the references section so the last Claude chunk always
+    receives it and can generate proper BibTeX entries.
+    """
+    for i in range(len(elements) - 1, -1, -1):
+        elem = elements[i]
+        if elem.get("type") in ("heading", "paragraph"):
+            if elem.get("text", "").strip().lower() in _REF_HEADINGS:
+                return elements[:i], elements[i:]   # heading stays with refs
+    return elements, []
+
+
 def _chunk_elements(elements: list) -> list[list]:
     """Split elements into groups whose JSON size ≈ _CHUNK_TARGET chars."""
     chunks, current, current_len = [], [], 0
@@ -522,9 +561,11 @@ def _chunk_elements(elements: list) -> list[list]:
     return chunks
 
 
-def _convert_single(content: dict, template: str = "auto") -> tuple[str, str, str]:
+async def _convert_single(content: dict, template: str = "auto") -> tuple[str, str, str]:
     content_json = json.dumps(content, ensure_ascii=False, indent=2)
-    full_text = _call_claude(USER_TEMPLATE.format(content_json=content_json), max_tokens=16000, template=template)
+    full_text = await _call_claude_async(
+        USER_TEMPLATE.format(content_json=content_json), max_tokens=16000, template=template,
+    )
 
     latex_content = _extract_between(full_text, "===LATEX_START===", "===LATEX_END===")
     bib_raw       = _extract_between(full_text, "===BIB_START===",   "===BIB_END===")
@@ -545,25 +586,37 @@ def _convert_single(content: dict, template: str = "auto") -> tuple[str, str, st
     return latex_content, bib_content, full_text
 
 
-def _convert_chunked(content: dict, template: str = "auto") -> tuple[str, str, str]:
-    elements   = content.get("elements", [])
-    metadata   = content.get("metadata", {})
-    image_list = content.get("image_list", [])
-    chunks     = _chunk_elements(elements)
-    n          = len(chunks)
+async def _convert_chunked(content: dict, template: str = "auto") -> tuple[str, str, str]:
+    all_elements = content.get("elements", [])
+    metadata     = content.get("metadata", {})
+    image_list   = content.get("image_list", [])
 
-    # Edge case: chunking produced a single chunk anyway
+    # Always keep the references section in the last chunk so Claude can
+    # generate complete BibTeX regardless of how the document is split.
+    body_elements, ref_elements = _find_references_section(all_elements)
+    chunks = _chunk_elements(body_elements)
+
+    # Attach references to the last body chunk (or make them their own chunk)
+    if ref_elements:
+        if chunks:
+            chunks[-1] = chunks[-1] + ref_elements
+        else:
+            chunks = [ref_elements]
+
+    n = len(chunks)
+
+    # Edge case: everything fits in one chunk after all
     if n == 1:
-        return _convert_single(content, template)
+        return await _convert_single(content, template)
 
     all_raw: list[str] = []
 
-    # --- Chunk 1: preamble + body start ---
+    # --- Chunk 1: preamble + body start (awaited first, needed before middle) ---
     first_json = json.dumps(
         {"metadata": metadata, "elements": chunks[0], "image_list": image_list},
         ensure_ascii=False, indent=2,
     )
-    first_text = _call_claude(
+    first_text = await _call_claude_async(
         _FIRST_CHUNK_TEMPLATE.format(n_total=n, content_json=first_json),
         max_tokens=8000,
         template=template,
@@ -577,26 +630,33 @@ def _convert_chunked(content: dict, template: str = "auto") -> tuple[str, str, s
     # Remove accidental \end{document} from the first chunk
     latex_body = re.sub(r'\\end\{document\}\s*$', '', latex_body).rstrip()
 
-    # --- Middle chunks: body only ---
-    for i, chunk in enumerate(chunks[1:-1], start=2):
-        chunk_json = json.dumps(
-            {"metadata": {}, "elements": chunk, "image_list": []},
-            ensure_ascii=False, indent=2,
-        )
-        chunk_text = _call_claude(
-            _MIDDLE_CHUNK_TEMPLATE.format(i=i, n_total=n, content_json=chunk_json),
-            max_tokens=8000,
-            template=template,
-        )
-        all_raw.append(chunk_text)
-        latex_body += "\n\n" + chunk_text.strip()
+    # --- Middle chunks: fully parallel (they are independent) ---
+    if n > 2:
+        middle_prompts = [
+            _MIDDLE_CHUNK_TEMPLATE.format(
+                i=i,
+                n_total=n,
+                content_json=json.dumps(
+                    {"metadata": {}, "elements": chunk, "image_list": []},
+                    ensure_ascii=False, indent=2,
+                ),
+            )
+            for i, chunk in enumerate(chunks[1:-1], start=2)
+        ]
+        middle_texts: list[str] = await asyncio.gather(*[
+            _call_claude_async(prompt, max_tokens=8000, template=template)
+            for prompt in middle_prompts
+        ])
+        for text in middle_texts:
+            all_raw.append(text)
+            latex_body += "\n\n" + text.strip()
 
-    # --- Last chunk: close document + bib ---
+    # --- Last chunk: close document + bibliography ---
     last_json = json.dumps(
         {"metadata": {}, "elements": chunks[-1], "image_list": []},
         ensure_ascii=False, indent=2,
     )
-    last_text = _call_claude(
+    last_text = await _call_claude_async(
         _LAST_CHUNK_TEMPLATE.format(i=n, n_total=n, content_json=last_json),
         max_tokens=8000,
         template=template,
@@ -621,11 +681,11 @@ def _convert_chunked(content: dict, template: str = "auto") -> tuple[str, str, s
     return latex_content, bib_content, "\n\n---CHUNK BREAK---\n\n".join(all_raw)
 
 
-def convert_to_latex(content: dict, template: str = "auto") -> tuple[str, str, str]:
+async def convert_to_latex(content: dict, template: str = "auto") -> tuple[str, str, str]:
     content_json_size = len(json.dumps(content, ensure_ascii=False))
     if content_json_size <= _SINGLE_CALL_LIMIT:
-        return _convert_single(content, template)
-    return _convert_chunked(content, template)
+        return await _convert_single(content, template)
+    return await _convert_chunked(content, template)
 
 
 # ---------------------------------------------------------------------------
@@ -662,9 +722,9 @@ async def convert_word_to_latex(
     if not content.get("elements"):
         raise HTTPException(status_code=422, detail="The document is empty or has no readable content.")
 
-    # Convert to LaTeX via Claude
+    # Convert to LaTeX via Claude (non-blocking async)
     try:
-        latex_content, bib_content, raw_response = convert_to_latex(content, template)
+        latex_content, bib_content, raw_response = await convert_to_latex(content, template)
     except anthropic.APIError as exc:
         raise HTTPException(status_code=502, detail=f"Claude API error: {exc}")
     except Exception as exc:

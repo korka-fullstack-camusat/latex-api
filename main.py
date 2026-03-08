@@ -388,21 +388,24 @@ Rules:
     c. Detect citation style from the references section of the document.
 
     d. APA style (most common — Author, Year format):
-       - ALWAYS add \\usepackage[round,authoryear]{natbib} to the preamble.
-       - Use bibliographystyle{apalike}.
-       - In-text parenthetical citation  → \\citep{key}   → produces (Author, Year)
-       - In-text narrative citation       → \\citet{key}   → produces Author (Year)
-       - NEVER use plain \\cite{} for APA; it produces [key] which is wrong.
+       - ALWAYS use biblatex (NOT natbib) for APA documents.
+       - Add to preamble:
+           \\usepackage[style=authoryear, backend=biber]{biblatex}
+           \\addbibresource{references.bib}
+       - Single parenthetical citation → \\parencite{key}   → (Author, Year)
+       - Single narrative citation     → \\textcite{key}    → Author (Year)
+       - NEVER use \\citep or \\citet with biblatex — they do not exist.
 
     e. IEEE / numeric styles (ieeetr, unsrt, plain):
-       - Do NOT add natbib.
+       - Use plain \\usepackage{cite} (NOT biblatex).
        - Use plain \\cite{key} → produces [1], [2], …
+       - Bibliography: \\bibliographystyle{ieeetr}\\bibliography{references}
 
-    f. Default to APA/natbib if the citation style cannot be determined.
+    f. Default to APA/biblatex if the citation style cannot be determined.
 
     g. In the LaTeX body, replace the original reference list with:
-       \\bibliographystyle{apalike}   % or ieeetr / plain etc.
-       \\bibliography{references}
+       - APA/biblatex  : \\printbibliography
+       - Numeric/bibtex: \\bibliographystyle{ieeetr}\\bibliography{references}
        (do NOT reproduce the references as plain text in the document body)
 
     h. TWO-PASS CITATION PROCESSING — MANDATORY:
@@ -423,22 +426,22 @@ Rules:
        or "[1]" text in the output.
 
        ● Single citation:
-         APA  : (Smith, 2020)          →  \\citep{Smith_2020}
-                Smith (2020)           →  \\citet{Smith_2020}
-                Smith et al. (2020)    →  \\citet{Smith_etal_2020}
+         APA  : (Smith, 2020)          →  \\parencite{Smith_2020}
+                Smith (2020)           →  \\textcite{Smith_2020}
+                Smith et al. (2020)    →  \\textcite{Smith_etal_2020}
          Num  : [1]                    →  \\cite{ref1}
          Super: ¹  (superscript run)   →  \\cite{ref1}
 
        ● Multiple citations grouped at the same location
-         (use ONE command with comma-separated keys, NOT separate commands):
-         APA  : (Smith, 2020; Jones, 2019)      →  \\citep{Smith_2020, Jones_2019}
-                (Smith, 2020; Jones et al., 2018) → \\citep{Smith_2020, Jones_etal_2018}
-         Num  : [1,2]  or  [1][2]  or  ¹²       →  \\cite{ref1, ref2}
-                [1-3]  (range)                   →  \\cite{ref1, ref2, ref3}
+         APA  : (Smith, 2020; Jones, 2019)       →  \\cites{Smith_2020}{Jones_2019}
+                (Smith, 2020; Jones et al., 2018) →  \\cites{Smith_2020}{Jones_etal_2018}
+         Num  : [1,2]  or  [1][2]  or  ¹²        →  \\cite{ref1, ref2}
+                [1-3]  (range)                    →  \\cite{ref1, ref2, ref3}
 
-       ● NEVER use \\cites (that is biblatex, not natbib).
-       ● NEVER emit two separate \\citep{}\\citep{} side by side;
-         always merge into \\citep{key1, key2, key3}.
+       ● Each key in \\cites gets its OWN pair of braces: \\cites{k1}{k2}{k3}
+       ● NEVER use \\citep or \\citet with biblatex.
+       ● NEVER emit two separate \\parencite{}\\parencite{} side by side;
+         always merge into \\cites{key1}{key2}.
 
 13. Handle special characters and accents.
 14. Close with \\end{document}.
@@ -502,7 +505,9 @@ DOCUMENT CONTENT (JSON):
 Generate the complete LaTeX preamble and body for these elements.
 Do NOT include \\end{{document}} — more content follows in subsequent parts.
 Replace every in-text citation using the KEY MAP above (if provided).
-Use \\citep{{k1, k2}} for grouped citations — ONE command, comma-separated keys.
+APA single: \\parencite{{key}} or \\textcite{{key}}
+APA grouped: \\cites{{k1}}{{k2}}{{k3}}  — one brace pair per key
+Numeric grouped: \\cite{{ref1, ref2}}
 
 Respond with EXACTLY:
 
@@ -520,7 +525,9 @@ DOCUMENT CONTENT (JSON):
 Output ONLY the raw LaTeX body lines for these elements.
 No \\documentclass, no preamble, no \\end{{document}}, no markers.
 Replace every in-text citation using the KEY MAP above (if provided).
-Use \\citep{{k1, k2}} for grouped citations — ONE command, comma-separated keys.
+APA single: \\parencite{{key}} or \\textcite{{key}}
+APA grouped: \\cites{{k1}}{{k2}}{{k3}}  — one brace pair per key
+Numeric grouped: \\cite{{ref1, ref2}}
 """
 
 # Pre-pass template: extract key map + BibTeX from the references section only.
@@ -702,12 +709,15 @@ def _thebibliography_to_bibtex(latex: str) -> tuple[str, str]:
 
 def _postprocess(latex_content: str, bib_raw: str, bib_style: str, citation_type: str,
                  raw_response: str = "") -> tuple[str, str]:
-    """Inject bibliography and fix APA citations.
+    """Inject bibliography and fix citations.
 
     Priority for BibTeX content:
     1. Between ===BIB_START=== / ===BIB_END=== markers
     2. @article/@book/... entries found anywhere in the raw response
     3. \\begin{thebibliography} converted to @misc entries
+
+    APA → biblatex (\\parencite / \\cites / \\printbibliography)
+    Numeric → bibtex + \\cite + \\bibliography{references}
     """
     bib_raw = bib_raw.strip()
     bib_style = bib_style.strip()
@@ -725,26 +735,52 @@ def _postprocess(latex_content: str, bib_raw: str, bib_style: str, citation_type
     if not bib_content:
         latex_content, bib_content = _thebibliography_to_bibtex(latex_content)
     elif "\\begin{thebibliography}" in latex_content:
-        # We have BibTeX — strip the thebibliography block from .tex
         latex_content, _ = _thebibliography_to_bibtex(latex_content)
 
     is_apa = "apa" in citation_type or bib_style == "apalike"
 
     if bib_content and is_apa:
-        if "natbib" not in latex_content:
+        # Ensure biblatex (authoryear) is loaded — remove any legacy natbib
+        latex_content = re.sub(r'\\usepackage\[[^\]]*\]\{natbib\}\s*\n?', '', latex_content)
+        biblatex_pkg = "\\usepackage[style=authoryear, backend=biber]{biblatex}\n" \
+                       "\\addbibresource{references.bib}"
+        if "biblatex" not in latex_content:
             latex_content = latex_content.replace(
                 "\\begin{document}",
-                "\\usepackage[round,authoryear]{natbib}\n\\begin{document}",
+                biblatex_pkg + "\n\\begin{document}",
             )
-        latex_content = re.sub(r'\\cite\{', r'\\citep{', latex_content)
+        # Fix any residual natbib commands → biblatex equivalents
+        latex_content = re.sub(r'\\citep\{([^}]+)\}', r'\\parencite{\1}', latex_content)
+        latex_content = re.sub(r'\\citet\{([^}]+)\}', r'\\textcite{\1}', latex_content)
+        # \cite{k1, k2} (comma-separated) → \cites{k1}{k2}
+        def _expand_cite(m):
+            keys = [k.strip() for k in m.group(1).split(',') if k.strip()]
+            if len(keys) > 1:
+                return "\\cites" + "".join(f"{{{k}}}" for k in keys)
+            return f"\\parencite{{{keys[0]}}}" if keys else m.group(0)
+        latex_content = re.sub(r'\\cite\{([^}]+)\}', _expand_cite, latex_content)
 
     if bib_content and "\\end{document}" in latex_content:
-        if "\\bibliography{" not in latex_content and "\\printbibliography" not in latex_content:
-            style_cmd = f"\\bibliographystyle{{{bib_style}}}\n" if bib_style else ""
-            latex_content = latex_content.replace(
-                "\\end{document}",
-                f"{style_cmd}\\bibliography{{references}}\n\\end{{document}}",
+        if is_apa:
+            # biblatex: replace \bibliography{} with \printbibliography
+            latex_content = re.sub(
+                r'\\bibliographystyle\{[^}]*\}\s*\n?\\bibliography\{[^}]*\}',
+                '\\printbibliography',
+                latex_content,
             )
+            if "\\printbibliography" not in latex_content:
+                latex_content = latex_content.replace(
+                    "\\end{document}",
+                    "\\printbibliography\n\\end{document}",
+                )
+        else:
+            # bibtex numeric: use \bibliography{references}
+            if "\\bibliography{" not in latex_content:
+                style_cmd = f"\\bibliographystyle{{{bib_style}}}\n" if bib_style else ""
+                latex_content = latex_content.replace(
+                    "\\end{document}",
+                    f"{style_cmd}\\bibliography{{references}}\n\\end{{document}}",
+                )
 
     return latex_content, bib_content
 
@@ -866,7 +902,9 @@ def _format_key_map_hint(key_map: dict) -> str:
         return ""
     lines = [
         "CITATION KEY MAP — replace every in-text citation using these keys:",
-        "(grouped citations → ONE \\citep{k1, k2} command, comma-separated)",
+        "  APA single: \\parencite{key} or \\textcite{key}",
+        "  APA grouped: \\cites{k1}{k2}{k3}  (one brace pair per key)",
+        "  Numeric grouped: \\cite{ref1, ref2}",
     ]
     for original, key in key_map.items():
         lines.append(f'  "{original}" → {key}')

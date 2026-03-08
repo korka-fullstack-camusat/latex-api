@@ -3,6 +3,7 @@ import io
 import re
 import json
 import time
+import unicodedata
 import zipfile
 import xml.etree.ElementTree as ET
 from typing import Optional
@@ -277,24 +278,34 @@ Rules:
    \\usepackage{parskip}
    \\usepackage[colorlinks=true, linkcolor=blue, citecolor=blue, urlcolor=blue, filecolor=blue]{hyperref}
 
-3. PARAGRAPH FORMATTING (mandatory):
+3. LANGUAGE / BABEL (mandatory):
+   - Detect the document language from its text content.
+   - For French documents: add \\usepackage[french]{babel} to the preamble
+     (after inputenc / fontenc). This handles French spacing rules, guillemets,
+     section name translations (Chapitre, Table des matières…).
+   - For English documents: add \\usepackage[english]{babel}.
+   - For bilingual documents: \\usepackage[french,english]{babel} (last = main).
+   - The \\usepackage[T1]{fontenc} already listed in rule 2 is REQUIRED for
+     correct rendering of accented characters in all European languages.
+
+4. PARAGRAPH FORMATTING (mandatory):
    - ALWAYS add \\setlength{\\parindent}{0pt} after \\begin{document} (no indent at start of paragraphs).
    - ALWAYS add \\setlength{\\parskip}{6pt} for spacing between paragraphs.
    - Do NOT use \\noindent individually; the global setting handles it.
 
-4. HYPERREF LINKS: Use colorlinks=true with blue color for ALL link types.
+5. HYPERREF LINKS: Use colorlinks=true with blue color for ALL link types.
    NEVER use colored boxes (pdfborder or default boxed links). Links must appear
    as blue-colored text, not wrapped in green/red/colored rectangles.
 
-5. Formatting: bold→\\textbf{}, italic→\\textit{}, underline→\\underline{},
+6. Formatting: bold→\\textbf{}, italic→\\textit{}, underline→\\underline{},
    superscript→\\textsuperscript{}, subscript→\\textsubscript{}.
-6. Headings: Heading 1→\\section, 2→\\subsection, 3→\\subsubsection,
+7. Headings: Heading 1→\\section, 2→\\subsection, 3→\\subsubsection,
    Title→\\title{} + \\maketitle, Subtitle→use \\date{} or subtitle package.
-7. Tables → tabular with booktabs (\\toprule, \\midrule, \\bottomrule).
-8. Bulleted lists → itemize; numbered → enumerate.
-9. Quotes → quotation environment.
+8. Tables → tabular with booktabs (\\toprule, \\midrule, \\bottomrule).
+9. Bulleted lists → itemize; numbered → enumerate.
+10. Quotes → quotation environment.
 
-10. IMAGES (important):
+11. IMAGES (important):
     Each element with "type":"image" contains an "images" list of filenames
     (e.g. ["figure_1.png"]).  These files ARE included in the ZIP alongside
     the .tex file.
@@ -314,7 +325,7 @@ Rules:
       \\caption{Figure extracted from document}.
     - Always use the float package option [H] so figures stay in place.
 
-11. References / Bibliography — CRITICAL RULES:
+12. References / Bibliography — CRITICAL RULES:
     a. NEVER use \\begin{thebibliography}...\\end{thebibliography} in the LaTeX
        document. ALWAYS use an external BibTeX file referenced via
        \\bibliography{references}. Every single reference entry MUST appear
@@ -346,10 +357,10 @@ Rules:
        \\bibliography{references}
        (do NOT reproduce the references as plain text in the document body)
 
-12. Handle special characters and accents.
-13. Close with \\end{document}.
+13. Handle special characters and accents.
+14. Close with \\end{document}.
 
-14. MATHEMATICAL EQUATIONS:
+15. MATHEMATICAL EQUATIONS:
     - Inline math: wrap in $...$
     - Display / numbered equation: use \\begin{equation}...\\end{equation}
     - Un-numbered display: \\[ ... \\]
@@ -357,7 +368,7 @@ Rules:
     - Superscripts from text (x²) → x^{2}; subscripts (x₁) → x_{1}
     - Always add \\usepackage{amsmath} (already listed in rule 2).
 
-15. CODE BLOCKS AND VERBATIM:
+16. CODE BLOCKS AND VERBATIM:
     - Add \\usepackage{listings} and \\usepackage{xcolor} to the preamble.
     - Add this setup after the package declarations:
       \\lstset{basicstyle=\\ttfamily\\small, breaklines=true, frame=single,
@@ -455,7 +466,12 @@ Respond with EXACTLY this structure:
 
 # JSON chars thresholds
 _SINGLE_CALL_LIMIT = 80_000   # below → one API call
-_CHUNK_TARGET      = 50_000   # target JSON chars per chunk
+_CHUNK_TARGET      = 30_000   # target JSON chars per chunk (smaller = faster parallel)
+_SMALL_DOC_LIMIT   = 25_000   # below → use Haiku (faster) for single call
+
+# Model selection
+_MODEL_SMART = "claude-sonnet-4-6"          # preamble, BibTeX, complex logic
+_MODEL_FAST  = "claude-haiku-4-5-20251001"  # middle chunks (body-only, 5× faster)
 
 # LaTeX template overrides
 _TEMPLATE_HINTS: dict[str, str] = {
@@ -473,7 +489,8 @@ def _extract_between(text: str, start: str, end: str) -> str:
     return m.group(1).strip() if m else ""
 
 
-def _call_claude_sync(user_message: str, max_tokens: int = 8000, template: str = "auto") -> str:
+def _call_claude_sync(user_message: str, max_tokens: int = 8000,
+                      template: str = "auto", model: str = _MODEL_SMART) -> str:
     """Blocking Claude call — run inside a thread via _call_claude_async."""
     system = SYSTEM_PROMPT
     if template in _TEMPLATE_HINTS:
@@ -483,7 +500,7 @@ def _call_claude_sync(user_message: str, max_tokens: int = 8000, template: str =
     for attempt in range(3):
         try:
             with client.messages.stream(
-                model="claude-sonnet-4-6",
+                model=model,
                 max_tokens=max_tokens,
                 system=system,
                 messages=[{"role": "user", "content": user_message}],
@@ -491,7 +508,6 @@ def _call_claude_sync(user_message: str, max_tokens: int = 8000, template: str =
                 response = stream.get_final_message()
             return "".join(block.text for block in response.content if block.type == "text")
         except anthropic.APIStatusError as exc:
-            # 529 = overloaded; 500 = internal — worth retrying
             if exc.status_code in (500, 529) and attempt < 2:
                 last_exc = exc
                 time.sleep(2 ** attempt)
@@ -506,14 +522,15 @@ def _call_claude_sync(user_message: str, max_tokens: int = 8000, template: str =
     raise last_exc
 
 
-async def _call_claude_async(user_message: str, max_tokens: int = 8000, template: str = "auto") -> str:
+async def _call_claude_async(user_message: str, max_tokens: int = 8000,
+                             template: str = "auto", model: str = _MODEL_SMART) -> str:
     """Non-blocking wrapper: runs the sync Claude call in a thread pool.
 
     The global semaphore caps concurrent API calls so we never flood the
     Anthropic API regardless of how many HTTP requests FastAPI is handling.
     """
     async with _API_SEMAPHORE:
-        return await asyncio.to_thread(_call_claude_sync, user_message, max_tokens, template)
+        return await asyncio.to_thread(_call_claude_sync, user_message, max_tokens, template, model)
 
 
 _BIBTEX_ENTRY_RE = re.compile(
@@ -604,27 +621,35 @@ def _postprocess(latex_content: str, bib_raw: str, bib_style: str, citation_type
 
 
 _REF_HEADINGS = {
-    "references", "bibliography", "bibliographie", "références",
-    "works cited", "literature", "sources", "liste de références",
+    # English
+    "references", "bibliography", "works cited", "literature",
+    "sources", "reference list", "cited works", "citations",
+    # French
+    "references bibliographiques", "bibliographie", "references",
+    "liste de references", "liste des references", "sources bibliographiques",
+    "ouvrages cites", "ouvrages consultes", "travaux cites",
+    # Generic
+    "literature cited", "further reading", "notes and references",
 }
+
+
+def _normalise_text(t: str) -> str:
+    """Lowercase, strip accents, collapse whitespace."""
+    return unicodedata.normalize("NFD", t).encode("ascii", "ignore").decode().lower().strip()
 
 
 def _find_references_section(elements: list) -> tuple[list, list]:
     """Split elements into (body_elements, references_elements).
 
-    Searches from the end for a heading/paragraph whose text starts with or
-    equals a known bibliography keyword (case-insensitive, accent-insensitive).
-    Everything from that element onward goes to the last chunk so Claude always
-    sees the full reference list when generating BibTeX.
+    Searches from the end for a heading/paragraph whose normalised text
+    matches or starts with a known bibliography keyword.  Everything from
+    that element onward goes to the last chunk so Claude always sees the full
+    reference list when generating BibTeX.
     """
-    def _normalise(t: str) -> str:
-        import unicodedata
-        return unicodedata.normalize("NFD", t).encode("ascii", "ignore").decode().lower().strip()
-
     for i in range(len(elements) - 1, -1, -1):
         elem = elements[i]
         if elem.get("type") in ("heading", "paragraph"):
-            t = _normalise(elem.get("text", ""))
+            t = _normalise_text(elem.get("text", ""))
             if any(t == h or t.startswith(h) for h in _REF_HEADINGS):
                 return elements[:i], elements[i:]   # heading stays with refs
     return elements, []
@@ -646,10 +671,12 @@ def _chunk_elements(elements: list) -> list[list]:
     return chunks
 
 
-async def _convert_single(content: dict, template: str = "auto") -> tuple[str, str, str]:
+async def _convert_single(content: dict, template: str = "auto",
+                          model: str = _MODEL_SMART) -> tuple[str, str, str]:
     content_json = json.dumps(content, ensure_ascii=False, indent=2)
     full_text = await _call_claude_async(
-        USER_TEMPLATE.format(content_json=content_json), max_tokens=16000, template=template,
+        USER_TEMPLATE.format(content_json=content_json),
+        max_tokens=16000, template=template, model=model,
     )
 
     latex_content = _extract_between(full_text, "===LATEX_START===", "===LATEX_END===")
@@ -681,7 +708,6 @@ async def _convert_chunked(content: dict, template: str = "auto") -> tuple[str, 
     body_elements, ref_elements = _find_references_section(all_elements)
     chunks = _chunk_elements(body_elements)
 
-    # Attach references to the last body chunk (or make them their own chunk)
     if ref_elements:
         if chunks:
             chunks[-1] = chunks[-1] + ref_elements
@@ -689,64 +715,61 @@ async def _convert_chunked(content: dict, template: str = "auto") -> tuple[str, 
             chunks = [ref_elements]
 
     n = len(chunks)
-
-    # Edge case: everything fits in one chunk after all
     if n == 1:
         return await _convert_single(content, template)
 
-    all_raw: list[str] = []
+    # -----------------------------------------------------------------------
+    # Build one prompt per chunk, then fire ALL in parallel.
+    #
+    # Strategy:
+    #   chunk[0]   → _FIRST_CHUNK_TEMPLATE  → _MODEL_SMART (preamble + packages)
+    #   chunk[1..n-2] → _MIDDLE_CHUNK_TEMPLATE → _MODEL_FAST  (body only, Haiku)
+    #   chunk[n-1] → _LAST_CHUNK_TEMPLATE   → _MODEL_SMART (BibTeX + closing)
+    #
+    # Since every chunk is independent (no chunk reads the output of another),
+    # they can all run simultaneously.  Total wall-clock time ≈ slowest chunk
+    # instead of sum of all chunks.
+    # -----------------------------------------------------------------------
 
-    # --- Chunk 1: preamble + body start (awaited first, needed before middle) ---
-    first_json = json.dumps(
-        {"metadata": metadata, "elements": chunks[0], "image_list": image_list},
-        ensure_ascii=False, indent=2,
-    )
-    first_text = await _call_claude_async(
-        _FIRST_CHUNK_TEMPLATE.format(n_total=n, content_json=first_json),
-        max_tokens=8000,
-        template=template,
-    )
-    all_raw.append(first_text)
+    def _chunk_json(elements, meta=None, imgs=None):
+        return json.dumps(
+            {"metadata": meta or {}, "elements": elements, "image_list": imgs or []},
+            ensure_ascii=False, indent=2,
+        )
 
+    tasks = []
+    # First chunk
+    tasks.append(_call_claude_async(
+        _FIRST_CHUNK_TEMPLATE.format(n_total=n, content_json=_chunk_json(chunks[0], metadata, image_list)),
+        max_tokens=8000, template=template, model=_MODEL_SMART,
+    ))
+    # Middle chunks — Haiku (fast, body-text only)
+    for i, chunk in enumerate(chunks[1:-1], start=2):
+        tasks.append(_call_claude_async(
+            _MIDDLE_CHUNK_TEMPLATE.format(i=i, n_total=n, content_json=_chunk_json(chunk)),
+            max_tokens=6000, template=template, model=_MODEL_FAST,
+        ))
+    # Last chunk
+    tasks.append(_call_claude_async(
+        _LAST_CHUNK_TEMPLATE.format(i=n, n_total=n, content_json=_chunk_json(chunks[-1])),
+        max_tokens=8000, template=template, model=_MODEL_SMART,
+    ))
+
+    results: list[str] = await asyncio.gather(*tasks)
+
+    first_text   = results[0]
+    middle_texts = results[1:-1]
+    last_text    = results[-1]
+
+    # --- Assemble in order ---
     latex_body = _extract_between(first_text, "===LATEX_START===", "===LATEX_END===")
     if not latex_body:
         m = re.search(r"(\\documentclass.*)", first_text, re.DOTALL)
         latex_body = m.group(1).strip() if m else first_text.strip()
-    # Remove accidental \end{document} from the first chunk
     latex_body = re.sub(r'\\end\{document\}\s*$', '', latex_body).rstrip()
 
-    # --- Middle chunks: fully parallel (they are independent) ---
-    if n > 2:
-        middle_prompts = [
-            _MIDDLE_CHUNK_TEMPLATE.format(
-                i=i,
-                n_total=n,
-                content_json=json.dumps(
-                    {"metadata": {}, "elements": chunk, "image_list": []},
-                    ensure_ascii=False, indent=2,
-                ),
-            )
-            for i, chunk in enumerate(chunks[1:-1], start=2)
-        ]
-        middle_texts: list[str] = await asyncio.gather(*[
-            _call_claude_async(prompt, max_tokens=8000, template=template)
-            for prompt in middle_prompts
-        ])
-        for text in middle_texts:
-            all_raw.append(text)
-            latex_body += "\n\n" + text.strip()
-
-    # --- Last chunk: close document + bibliography ---
-    last_json = json.dumps(
-        {"metadata": {}, "elements": chunks[-1], "image_list": []},
-        ensure_ascii=False, indent=2,
-    )
-    last_text = await _call_claude_async(
-        _LAST_CHUNK_TEMPLATE.format(i=n, n_total=n, content_json=last_json),
-        max_tokens=8000,
-        template=template,
-    )
-    all_raw.append(last_text)
+    for text in middle_texts:
+        latex_body += "\n\n" + text.strip()
 
     last_body     = _extract_between(last_text, "===LATEX_CONTINUATION===", "===LATEX_CONTINUATION_END===")
     bib_raw       = _extract_between(last_text, "===BIB_START===",          "===BIB_END===")
@@ -757,12 +780,10 @@ async def _convert_chunked(content: dict, template: str = "auto") -> tuple[str, 
         last_body = last_text.strip()
 
     latex_content = latex_body + "\n\n" + last_body
-
-    # Safety: ensure document is closed
     if "\\end{document}" not in latex_content:
         latex_content += "\n\\end{document}"
 
-    full_raw = "\n\n---CHUNK BREAK---\n\n".join(all_raw)
+    full_raw = "\n\n---CHUNK BREAK---\n\n".join(results)
     latex_content, bib_content = _postprocess(latex_content, bib_raw, bib_style, citation_type, full_raw)
     return latex_content, bib_content, full_raw
 
@@ -770,7 +791,9 @@ async def _convert_chunked(content: dict, template: str = "auto") -> tuple[str, 
 async def convert_to_latex(content: dict, template: str = "auto") -> tuple[str, str, str]:
     content_json_size = len(json.dumps(content, ensure_ascii=False))
     if content_json_size <= _SINGLE_CALL_LIMIT:
-        return await _convert_single(content, template)
+        # Small documents: use Haiku — much faster, fully capable for simple docs
+        model = _MODEL_FAST if content_json_size <= _SMALL_DOC_LIMIT else _MODEL_SMART
+        return await _convert_single(content, template, model=model)
     return await _convert_chunked(content, template)
 
 

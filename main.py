@@ -1,6 +1,7 @@
 import io
 import re
 import json
+import time
 import zipfile
 import xml.etree.ElementTree as ET
 from typing import Optional
@@ -10,7 +11,7 @@ from docx import Document
 from docx.oxml.ns import qn
 import os
 
-from fastapi import FastAPI, File, HTTPException, UploadFile
+from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 
@@ -326,6 +327,27 @@ Rules:
 
 12. Handle special characters and accents.
 13. Close with \\end{document}.
+
+14. MATHEMATICAL EQUATIONS:
+    - Inline math: wrap in $...$
+    - Display / numbered equation: use \\begin{equation}...\\end{equation}
+    - Un-numbered display: \\[ ... \\]
+    - Common symbols: \\alpha, \\beta, \\sum_{i=1}^{n}, \\int_a^b, \\frac{a}{b}, \\sqrt{x}
+    - Superscripts from text (x²) → x^{2}; subscripts (x₁) → x_{1}
+    - Always add \\usepackage{amsmath} (already listed in rule 2).
+
+15. CODE BLOCKS AND VERBATIM:
+    - Add \\usepackage{listings} and \\usepackage{xcolor} to the preamble.
+    - Add this setup after the package declarations:
+      \\lstset{basicstyle=\\ttfamily\\small, breaklines=true, frame=single,
+               keywordstyle=\\color{blue}, commentstyle=\\color{gray},
+               stringstyle=\\color{orange}}
+    - For named code blocks use:
+      \\begin{lstlisting}[language=Python]  % or Bash / SQL / C / Java / JavaScript
+      ...code...
+      \\end{lstlisting}
+    - For generic command-line / unformatted text use \\begin{verbatim}...\\end{verbatim}.
+    - Detect the language from context (Python keywords, SQL SELECT/FROM, bash $ prompts…).
 """
 
 USER_TEMPLATE = """\
@@ -409,21 +431,52 @@ Respond with EXACTLY this structure:
 _SINGLE_CALL_LIMIT = 80_000   # below → one API call
 _CHUNK_TARGET      = 50_000   # target JSON chars per chunk
 
+# LaTeX template overrides
+_TEMPLATE_HINTS: dict[str, str] = {
+    "article": "Use \\documentclass{article}.",
+    "report":  "Use \\documentclass{report} with chapter-level sectioning.",
+    "ieee":    "Use \\documentclass[conference]{IEEEtran} in two-column IEEE layout. "
+               "Add \\usepackage{cite} instead of natbib for IEEE numeric citations.",
+    "beamer":  "Use \\documentclass{beamer}. Wrap each logical section in "
+               "\\begin{frame}{Title}...\\end{frame}. Choose a clean theme like 'Madrid'.",
+}
+
 
 def _extract_between(text: str, start: str, end: str) -> str:
     m = re.search(re.escape(start) + r"(.*?)" + re.escape(end), text, re.DOTALL)
     return m.group(1).strip() if m else ""
 
 
-def _call_claude(user_message: str, max_tokens: int = 8000) -> str:
-    with client.messages.stream(
-        model="claude-sonnet-4-6",
-        max_tokens=max_tokens,
-        system=SYSTEM_PROMPT,
-        messages=[{"role": "user", "content": user_message}],
-    ) as stream:
-        response = stream.get_final_message()
-    return "".join(block.text for block in response.content if block.type == "text")
+def _call_claude(user_message: str, max_tokens: int = 8000, template: str = "auto") -> str:
+    system = SYSTEM_PROMPT
+    if template in _TEMPLATE_HINTS:
+        system = system + f"\n\nTEMPLATE OVERRIDE: {_TEMPLATE_HINTS[template]}"
+
+    last_exc: Exception = RuntimeError("Unknown error")
+    for attempt in range(3):
+        try:
+            with client.messages.stream(
+                model="claude-sonnet-4-6",
+                max_tokens=max_tokens,
+                system=system,
+                messages=[{"role": "user", "content": user_message}],
+            ) as stream:
+                response = stream.get_final_message()
+            return "".join(block.text for block in response.content if block.type == "text")
+        except anthropic.APIStatusError as exc:
+            # 529 = overloaded; 500 = internal — worth retrying
+            if exc.status_code in (500, 529) and attempt < 2:
+                last_exc = exc
+                time.sleep(2 ** attempt)
+            else:
+                raise
+        except anthropic.APIConnectionError as exc:
+            if attempt < 2:
+                last_exc = exc
+                time.sleep(2 ** attempt)
+            else:
+                raise
+    raise last_exc
 
 
 def _postprocess(latex_content: str, bib_raw: str, bib_style: str, citation_type: str) -> tuple[str, str]:
@@ -469,9 +522,9 @@ def _chunk_elements(elements: list) -> list[list]:
     return chunks
 
 
-def _convert_single(content: dict) -> tuple[str, str, str]:
+def _convert_single(content: dict, template: str = "auto") -> tuple[str, str, str]:
     content_json = json.dumps(content, ensure_ascii=False, indent=2)
-    full_text = _call_claude(USER_TEMPLATE.format(content_json=content_json), max_tokens=16000)
+    full_text = _call_claude(USER_TEMPLATE.format(content_json=content_json), max_tokens=16000, template=template)
 
     latex_content = _extract_between(full_text, "===LATEX_START===", "===LATEX_END===")
     bib_raw       = _extract_between(full_text, "===BIB_START===",   "===BIB_END===")
@@ -492,7 +545,7 @@ def _convert_single(content: dict) -> tuple[str, str, str]:
     return latex_content, bib_content, full_text
 
 
-def _convert_chunked(content: dict) -> tuple[str, str, str]:
+def _convert_chunked(content: dict, template: str = "auto") -> tuple[str, str, str]:
     elements   = content.get("elements", [])
     metadata   = content.get("metadata", {})
     image_list = content.get("image_list", [])
@@ -501,7 +554,7 @@ def _convert_chunked(content: dict) -> tuple[str, str, str]:
 
     # Edge case: chunking produced a single chunk anyway
     if n == 1:
-        return _convert_single(content)
+        return _convert_single(content, template)
 
     all_raw: list[str] = []
 
@@ -513,6 +566,7 @@ def _convert_chunked(content: dict) -> tuple[str, str, str]:
     first_text = _call_claude(
         _FIRST_CHUNK_TEMPLATE.format(n_total=n, content_json=first_json),
         max_tokens=8000,
+        template=template,
     )
     all_raw.append(first_text)
 
@@ -532,6 +586,7 @@ def _convert_chunked(content: dict) -> tuple[str, str, str]:
         chunk_text = _call_claude(
             _MIDDLE_CHUNK_TEMPLATE.format(i=i, n_total=n, content_json=chunk_json),
             max_tokens=8000,
+            template=template,
         )
         all_raw.append(chunk_text)
         latex_body += "\n\n" + chunk_text.strip()
@@ -544,6 +599,7 @@ def _convert_chunked(content: dict) -> tuple[str, str, str]:
     last_text = _call_claude(
         _LAST_CHUNK_TEMPLATE.format(i=n, n_total=n, content_json=last_json),
         max_tokens=8000,
+        template=template,
     )
     all_raw.append(last_text)
 
@@ -565,11 +621,11 @@ def _convert_chunked(content: dict) -> tuple[str, str, str]:
     return latex_content, bib_content, "\n\n---CHUNK BREAK---\n\n".join(all_raw)
 
 
-def convert_to_latex(content: dict) -> tuple[str, str, str]:
+def convert_to_latex(content: dict, template: str = "auto") -> tuple[str, str, str]:
     content_json_size = len(json.dumps(content, ensure_ascii=False))
     if content_json_size <= _SINGLE_CALL_LIMIT:
-        return _convert_single(content)
-    return _convert_chunked(content)
+        return _convert_single(content, template)
+    return _convert_chunked(content, template)
 
 
 # ---------------------------------------------------------------------------
@@ -583,11 +639,15 @@ def convert_to_latex(content: dict) -> tuple[str, str, str]:
 )
 async def convert_word_to_latex(
     file: UploadFile = File(..., description="Word document (.docx)"),
+    template: str = Form("auto", description="LaTeX template: auto | article | report | ieee | beamer"),
 ):
     if not file.filename:
         raise HTTPException(status_code=400, detail="No filename provided.")
     if not file.filename.lower().endswith(".docx"):
         raise HTTPException(status_code=400, detail="Only .docx files are supported.")
+
+    if template not in ("auto", "article", "report", "ieee", "beamer"):
+        raise HTTPException(status_code=400, detail=f"Unknown template '{template}'. Choose: auto, article, report, ieee, beamer.")
 
     file_bytes = await file.read()
     if not file_bytes:
@@ -604,7 +664,7 @@ async def convert_word_to_latex(
 
     # Convert to LaTeX via Claude
     try:
-        latex_content, bib_content, raw_response = convert_to_latex(content)
+        latex_content, bib_content, raw_response = convert_to_latex(content, template)
     except anthropic.APIError as exc:
         raise HTTPException(status_code=502, detail=f"Claude API error: {exc}")
     except Exception as exc:
